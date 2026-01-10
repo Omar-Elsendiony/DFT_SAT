@@ -1,66 +1,34 @@
 import os
+from BenchParser import BenchParser
 
 class WireFaultMiter:
     def __init__(self, bench_file):
         self.bench_file = bench_file
-        self.inputs = []
-        self.outputs = []
-        self.gates = []
-        self.var_map = {}
+        
+        # Use shared parser
+        self.parser = BenchParser(bench_file)
+        
+        # Extract data from parser
+        self.inputs = self.parser.all_inputs      # PIs + PPIs
+        self.outputs = self.parser.all_outputs    # POs + PPOs
+        self.gates = self.parser.gates
+        
+        # Build variable map
+        self.var_map = self.parser.build_var_map()
+        self.next_var = len(self.var_map) + 1
+        
+        # Faulty circuit mapping (will be populated during miter build)
         self.faulty_map = {}
-        self.next_var = 1
         
         # Track Scan Chains for debug/miter construction
-        self.scan_inputs = []
-        self.scan_outputs = []
+        self.scan_inputs = self.parser.ppis
+        self.scan_outputs = self.parser.ppos
 
     def _get_var(self, name):
         if name not in self.var_map:
             self.var_map[name] = self.next_var
             self.next_var += 1
         return self.var_map[name]
-
-    def _parse_bench(self):
-        with open(self.bench_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                
-                if line.startswith('INPUT'):
-                    name = line[line.find('(')+1:line.find(')')]
-                    self.inputs.append(name)
-                    self._get_var(name)
-                    
-                elif line.startswith('OUTPUT'):
-                    name = line[line.find('(')+1:line.find(')')]
-                    self.outputs.append(name)
-                    self._get_var(name)
-                    
-                elif '=' in line:
-                    parts = line.split('=')
-                    out = parts[0].strip()
-                    rhs = parts[1].strip()
-                    g_type = rhs[:rhs.find('(')].strip().upper()
-                    in_str = rhs[rhs.find('(')+1:-1]
-                    inputs = [x.strip() for x in in_str.split(',')] if in_str else []
-                    
-                    # --- FIX: Handle Flip-Flops (Full-Scan) ---
-                    if g_type == 'DFF':
-                        # Output of DFF -> Pseudo Input
-                        self.inputs.append(out)
-                        self.scan_inputs.append(out)
-                        self._get_var(out)
-                        
-                        # Input to DFF -> Pseudo Output
-                        if len(inputs) > 0:
-                            self.outputs.append(inputs[0])
-                            self.scan_outputs.append(inputs[0])
-                            self._get_var(inputs[0])
-                        # Do NOT add to self.gates (loop cut)
-                    else:
-                        self.gates.append((out, g_type, inputs))
-                        self._get_var(out)
-                        for i in inputs: self._get_var(i)
 
     def build_miter(self, fault_wire, fault_type=None, force_diff=1):
         clauses = []
