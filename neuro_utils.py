@@ -1,87 +1,51 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv
 from torch_geometric.data import Data
+from BenchParser import BenchParser
 import math
 
-# --- 1. THE ADVANCED GNN MODEL ---
-class CircuitGNN_Advanced(torch.nn.Module):
-    def __init__(self, num_node_features=14, num_layers=8, hidden_dim=64, dropout=0.2):
-        super(CircuitGNN_Advanced, self).__init__()
-        self.dropout = dropout
-        self.num_layers = num_layers
-        self.convs = torch.nn.ModuleList()
-        self.bns = torch.nn.ModuleList()
-        
-        # Input Layer
-        self.convs.append(GATv2Conv(num_node_features, hidden_dim, heads=2, concat=False))
-        self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
-        
-        # Hidden Layers (Residuals)
-        for _ in range(num_layers - 2):
-            self.convs.append(GATv2Conv(hidden_dim, hidden_dim, heads=2, concat=False))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
-            
-        # Output Layer
-        self.convs.append(GATv2Conv(hidden_dim, 32, heads=2, concat=False))
-        self.bns.append(torch.nn.BatchNorm1d(32))
-        
-        self.classifier = torch.nn.Linear(32, 1)
-
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        
-        x = self.convs[0](x, edge_index)
-        x = self.bns[0](x)
-        x = F.elu(x)
-        
-        for i in range(1, self.num_layers - 1):
-            identity = x
-            x = self.convs[i](x, edge_index)
-            x = self.bns[i](x)
-            x = F.elu(x)
-            x = x + identity # Residual Connection
-            
-        x = self.convs[-1](x, edge_index)
-        x = self.bns[-1](x)
-        x = F.elu(x)
-        
-        return self.classifier(x) # Return Logits (No Sigmoid)
-
-# --- 2. FAST GRAPH EXTRACTOR (With SCOAP) ---
+# --- FAST GRAPH EXTRACTOR (With SCOAP) ---
 class FastGraphExtractor:
-    def __init__(self, bench_path, var_map):
+    def __init__(self, bench_path, var_map=None):
+        # Use shared parser
+        self.parser = BenchParser(bench_path)
+        
+        # Use provided var_map or build from parser
+        if var_map is None:
+            var_map = self.parser.build_var_map()
         self.var_map = var_map
+        
+        # Create ordered list of node names and indices
         self.ordered_names = sorted(var_map.keys(), key=lambda k: var_map[k])
         self.name_to_idx = {name: i for i, name in enumerate(self.ordered_names)}
         self.num_nodes = len(self.ordered_names)
         
+        # Build edge list and gate information
         self.edges_list = []
         self.gate_types = {}
         self.gate_inputs = {i: [] for i in range(self.num_nodes)}
         
-        with open(bench_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                if '=' in line and not line.startswith('INPUT') and not line.startswith('OUTPUT'):
-                    parts = line.split('=')
-                    out_name = parts[0].strip()
-                    rhs = parts[1].strip()
-                    g_type = rhs[:rhs.find('(')].strip().upper()
-                    in_str = rhs[rhs.find('(')+1:-1]
-                    inputs = [x.strip() for x in in_str.split(',')] if in_str else []
-                    
-                    self.gate_types[out_name] = g_type
-                    if out_name in self.name_to_idx:
-                        dst = self.name_to_idx[out_name]
-                        for inp in inputs:
-                            if inp in self.name_to_idx:
-                                src = self.name_to_idx[inp]
-                                self.edges_list.append([src, dst])
-                                self.gate_inputs[dst].append(src)
-
+        # Process gates from parser
+        for out, g_type, inputs in self.parser.gates:
+            self.gate_types[out] = g_type
+            if out in self.name_to_idx:
+                dst = self.name_to_idx[out]
+                for inp in inputs:
+                    if inp in self.name_to_idx:
+                        src = self.name_to_idx[inp]
+                        self.edges_list.append([src, dst])
+                        self.gate_inputs[dst].append(src)
+        
+        # Mark PPIs (DFF outputs) as special inputs
+        for ppi in self.parser.ppis:
+            if ppi in self.name_to_idx:
+                self.gate_types[ppi] = 'PPI'
+        
+        # Mark PIs
+        for pi in self.parser.inputs:
+            if pi not in self.gate_types and pi in self.name_to_idx:
+                self.gate_types[pi] = 'INPUT'
+        
+        # Build adjacency structures (including back edges from parser)
         self.adj = {i: [] for i in range(self.num_nodes)}
         self.parents = {i: [] for i in range(self.num_nodes)}
         for src, dst in self.edges_list:
@@ -90,7 +54,8 @@ class FastGraphExtractor:
             self.parents[dst].append(src)
 
         self.edge_index = torch.tensor(self.edges_list, dtype=torch.long).t().contiguous()
-        if self.edge_index.numel() == 0: self.edge_index = torch.empty((2, 0), dtype=torch.long)
+        if self.edge_index.numel() == 0: 
+            self.edge_index = torch.empty((2, 0), dtype=torch.long)
         self.x_base = self._build_base_features()
 
     def _calculate_scoap(self):
