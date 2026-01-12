@@ -1,0 +1,1900 @@
+===== FILE: BenchParser.py =====
+"""
+Shared Bench File Parser for DFT Analysis
+
+This module provides a unified parser for .bench files that:
+- Handles full-scan DFFs (Q output as PPI, D input as PPO)
+- Tracks back edges for bidirectional graph traversal
+- Provides a common data structure for both SAT and GNN models
+"""
+
+class BenchParser:
+    """
+    Unified parser for .bench format files with full-scan DFF support.
+    
+    For full-scan designs:
+    - DFF outputs (Q) are treated as Pseudo Primary Inputs (PPIs)
+    - DFF inputs (D) are treated as Pseudo Primary Outputs (PPOs)
+    - The circuit is "broken" at flip-flops to eliminate cycles
+    """
+    
+    def __init__(self, bench_file):
+        self.bench_file = bench_file
+        
+        # Primary Inputs/Outputs
+        self.inputs = []           # Primary Inputs (PIs)
+        self.outputs = []          # Primary Outputs (POs)
+        
+        # Pseudo Inputs/Outputs (from DFFs)
+        self.ppis = []             # Pseudo Primary Inputs (DFF Q outputs)
+        self.ppos = []             # Pseudo Primary Outputs (DFF D inputs)
+        
+        # All inputs/outputs combined
+        self.all_inputs = []       # PIs + PPIs
+        self.all_outputs = []      # POs + PPOs
+        
+        # Gate structure
+        self.gates = []            # List of (output, gate_type, inputs)
+        self.gate_dict = {}        # Map: output_name -> (gate_type, inputs)
+        
+        # DFF tracking
+        self.dffs = []             # List of (Q_output, D_input) tuples
+        self.dff_map = {}          # Map: Q_output -> D_input
+        
+        # Back edges (for reverse traversal)
+        self.back_edges = {}       # Map: input_wire -> [gates_it_drives]
+        
+        # Variable mapping (for SAT solver)
+        self.var_map = {}          # Map: wire_name -> variable_id
+        
+        # Parse the file
+        self._parse()
+    
+    def _parse(self):
+        """Parse the bench file and populate all data structures."""
+        with open(self.bench_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse INPUT declarations
+                if line.startswith('INPUT'):
+                    name = line[line.find('(')+1:line.find(')')]
+                    self.inputs.append(name)
+                    self.all_inputs.append(name)
+                    
+                # Parse OUTPUT declarations
+                elif line.startswith('OUTPUT'):
+                    name = line[line.find('(')+1:line.find(')')]
+                    self.outputs.append(name)
+                    self.all_outputs.append(name)
+                    
+                # Parse gate definitions
+                elif '=' in line:
+                    parts = line.split('=')
+                    out = parts[0].strip()
+                    rhs = parts[1].strip()
+                    
+                    # Extract gate type and inputs
+                    g_type = rhs[:rhs.find('(')].strip().upper()
+                    in_str = rhs[rhs.find('(')+1:-1]
+                    inputs = [x.strip() for x in in_str.split(',')] if in_str else []
+                    
+                    # Handle DFFs specially (Full-Scan assumption)
+                    if g_type == 'DFF':
+                        # Q output (out) becomes a PPI
+                        self.ppis.append(out)
+                        self.all_inputs.append(out)
+                        
+                        # D input becomes a PPO
+                        if len(inputs) > 0:
+                            d_input = inputs[0]
+                            self.ppos.append(d_input)
+                            self.all_outputs.append(d_input)
+                            
+                            # Track the DFF relationship
+                            self.dffs.append((out, d_input))
+                            self.dff_map[out] = d_input
+                        
+                        # Note: DFFs are NOT added to self.gates
+                        # This "breaks" the circuit at flip-flops
+                    else:
+                        # Regular combinational gate
+                        self.gates.append((out, g_type, inputs))
+                        self.gate_dict[out] = (g_type, inputs)
+                        
+                        # Build back edges for reverse traversal
+                        for inp in inputs:
+                            if inp not in self.back_edges:
+                                self.back_edges[inp] = []
+                            self.back_edges[inp].append(out)
+        
+        # Remove duplicates while preserving order
+        self.all_inputs = list(dict.fromkeys(self.all_inputs))
+        self.all_outputs = list(dict.fromkeys(self.all_outputs))
+    
+    def get_all_wires(self):
+        """Get all wire names in the circuit (inputs, outputs, and internal)."""
+        wires = set(self.all_inputs + self.all_outputs)
+        for out, _, inputs in self.gates:
+            wires.add(out)
+            wires.update(inputs)
+        return sorted(list(wires))
+    
+    def build_var_map(self):
+        """Build variable mapping for SAT solver (1-indexed)."""
+        if self.var_map:
+            return self.var_map  # Already built
+        
+        next_var = 1
+        for wire in self.get_all_wires():
+            if wire not in self.var_map:
+                self.var_map[wire] = next_var
+                next_var += 1
+        return self.var_map
+    
+    def get_fanout(self, wire_name):
+        """Get all gates driven by a wire (forward edges)."""
+        return self.back_edges.get(wire_name, [])
+    
+    def get_fanin(self, wire_name):
+        """Get the gate driving a wire (backward edge)."""
+        if wire_name in self.gate_dict:
+            return self.gate_dict[wire_name][1]  # Return inputs
+        return []
+    
+    def is_pi(self, wire_name):
+        """Check if wire is a Primary Input."""
+        return wire_name in self.inputs
+    
+    def is_po(self, wire_name):
+        """Check if wire is a Primary Output."""
+        return wire_name in self.outputs
+    
+    def is_ppi(self, wire_name):
+        """Check if wire is a Pseudo Primary Input (DFF Q)."""
+        return wire_name in self.ppis
+    
+    def is_ppo(self, wire_name):
+        """Check if wire is a Pseudo Primary Output (DFF D)."""
+        return wire_name in self.ppos
+    
+    def is_dff_output(self, wire_name):
+        """Check if wire is a DFF Q output."""
+        return wire_name in self.dff_map
+    
+    def get_dff_input(self, q_output):
+        """Get the D input for a DFF Q output."""
+        return self.dff_map.get(q_output)
+    
+    def get_gate_type(self, wire_name):
+        """Get the gate type that produces this wire."""
+        if wire_name in self.gate_dict:
+            return self.gate_dict[wire_name][0]
+        elif self.is_ppi(wire_name):
+            return 'PPI'
+        elif self.is_pi(wire_name):
+            return 'INPUT'
+        return None
+    
+    def __repr__(self):
+        return (f"BenchParser({self.bench_file})\n"
+                f"  PIs: {len(self.inputs)}, POs: {len(self.outputs)}\n"
+                f"  PPIs: {len(self.ppis)}, PPOs: {len(self.ppos)}\n"
+                f"  Gates: {len(self.gates)}, DFFs: {len(self.dffs)}")
+
+===== FILE: WireFaultMiter.py =====
+import os
+from BenchParser import BenchParser
+
+class WireFaultMiter:
+    def __init__(self, bench_file):
+        self.bench_file = bench_file
+        
+        # Use shared parser
+        self.parser = BenchParser(bench_file)
+        
+        # Extract data from parser
+        self.inputs = self.parser.all_inputs      # PIs + PPIs
+        self.outputs = self.parser.all_outputs    # POs + PPOs
+        self.gates = self.parser.gates
+        
+        # Build variable map
+        self.var_map = self.parser.build_var_map()
+        self.next_var = len(self.var_map) + 1
+        
+        # Faulty circuit mapping (will be populated during miter build)
+        self.faulty_map = {}
+        
+        # Track Scan Chains for debug/miter construction
+        self.scan_inputs = self.parser.ppis
+        self.scan_outputs = self.parser.ppos
+
+    def _get_var(self, name):
+        if name not in self.var_map:
+            self.var_map[name] = self.next_var
+            self.next_var += 1
+        return self.var_map[name]
+
+    def build_miter(self, fault_wire, fault_type=None, force_diff=1):
+        clauses = []
+        
+        # --- 1. Good Circuit ---
+        for out, g_type, inputs in self.gates:
+            self._add_gate_clauses(clauses, self.var_map[out], g_type, [self.var_map[i] for i in inputs])
+            
+        # --- 2. Faulty Circuit ---
+        # Map inputs to same vars, but internal wires get new vars
+        self.faulty_map = {name: self.var_map[name] for name in self.inputs}
+        for out, _, _ in self.gates:
+            if out not in self.faulty_map:
+                self.faulty_map[out] = self.next_var
+                self.next_var += 1
+                
+        # Inject Fault (Stuck-at)
+        if fault_wire in self.faulty_map:
+            fault_gate_var = self.faulty_map[fault_wire]
+            if fault_type == 1: clauses.append([fault_gate_var])   # Stuck-at-1
+            elif fault_type == 0: clauses.append([-fault_gate_var]) # Stuck-at-0
+
+        for out, g_type, inputs in self.gates:
+            # --- CRITICAL FIX: Disconnect Logic for Faulty Wire ---
+            # If this gate drives the wire that is currently stuck, 
+            # we must NOT generate clauses for it. The wire is controlled by the fault, not the gate.
+            if out == fault_wire:
+                continue
+            # -----------------------------------------------------
+
+            out_var = self.faulty_map[out]
+            in_vars = [self.faulty_map.get(i) for i in inputs]
+            if None in in_vars: continue # Skip if inputs are missing (rare scan edge case)
+            self._add_gate_clauses(clauses, out_var, g_type, in_vars)
+
+        # --- 3. Miter Comparator (XOR Outputs) ---
+        miter_out = self.next_var; self.next_var += 1
+        diff_vars = []
+        
+        unique_outputs = list(set(self.outputs)) # Handles POs and PPOs
+        
+        for out in unique_outputs:
+            if out not in self.var_map or out not in self.faulty_map: continue
+            
+            good = self.var_map[out]
+            bad = self.faulty_map[out]
+            diff = self.next_var; self.next_var += 1
+            
+            # XOR Logic
+            clauses.append([-good, -bad, -diff])
+            clauses.append([good, bad, -diff])
+            clauses.append([-good, bad, diff])
+            clauses.append([good, -bad, diff])
+            diff_vars.append(diff)
+            
+        # Big OR Gate (Any difference triggers Miter)
+        big_or = [-miter_out]
+        for d in diff_vars:
+            clauses.append([-d, miter_out])
+            big_or.append(d)
+        clauses.append(big_or)
+        clauses.append([miter_out]) # Force Miter = 1
+        
+        return clauses
+
+    def _add_gate_clauses(self, clauses, out, g_type, inputs):
+        if g_type == 'AND':
+            for i in inputs: clauses.append([-out, i])
+            clauses.append([out] + [-i for i in inputs])
+        elif g_type == 'OR':
+            for i in inputs: clauses.append([out, -i])
+            clauses.append([-out] + inputs)
+        elif g_type == 'NOT':
+            clauses.append([-out, -inputs[0]])
+            clauses.append([out, inputs[0]])
+        elif g_type == 'NAND':
+            for i in inputs: clauses.append([out, i])
+            clauses.append([-out] + [-i for i in inputs])
+        elif g_type == 'NOR':
+            for i in inputs: clauses.append([-out, -i])
+            clauses.append([out] + inputs)
+        elif g_type == 'XOR':
+            if len(inputs) == 2:
+                a, b = inputs
+                clauses.append([-out, -a, -b])
+                clauses.append([-out, a, b])
+                clauses.append([out, -a, b])
+                clauses.append([out, a, -b])
+        elif g_type == 'BUFF':
+             clauses.append([-out, inputs[0]])
+             clauses.append([out, -inputs[0]])
+===== FILE: data_train_bench.py =====
+"""
+Complete pipeline for importance-aware GNN training
+This replaces your current generate_oracle_data.py and train_oracle.py
+"""
+
+import os
+import sys
+import time
+import csv
+import torch
+import torch.nn as nn
+from torch_geometric.nn import GATv2Conv
+# import torch.nn.functional as F
+import torch.optim as optim
+import random
+from pysat.solvers import Glucose3
+from pysat.formula import CNF
+from tqdm import tqdm
+from torch_geometric.loader import DataLoader
+from WireFaultMiter import WireFaultMiter
+from neuro_utils import FastGraphExtractor
+
+
+# Configs
+BENCH_DIR = "../synthetic_bench"
+DATASET_PATH = "dataset_oracle_importance.pt"
+SAMPLES_PER_FILE = 50
+MODEL_PATH = "gnn_model_importance_aware.pth"
+EPOCHS = 20
+BATCH_SIZE = 32
+
+
+# =============================================================================
+# PART 1: ENHANCED DATA GENERATION WITH IMPORTANCE
+# =============================================================================
+
+def get_target_files():
+    if not os.path.exists(BENCH_DIR): return []
+    return [f for f in os.listdir(BENCH_DIR) if f.endswith(".bench")]
+
+def generate_importance_aware_dataset():
+    """
+    Enhanced version that collects:
+    1. Correct solution (y_solution)
+    2. Importance scores (y_importance) 
+    3. Base conflict count (for analysis)
+    """
+    print(f"--- MINING IMPORTANCE-AWARE ORACLE DATA ---")
+    dataset = []
+    
+    if not os.path.exists(BENCH_DIR):
+        print(f"Error: {BENCH_DIR} not found.")
+        return
+    
+    files = [f for f in os.listdir(BENCH_DIR) if f.endswith('.bench')]
+    
+    for filename in tqdm(files, desc="Mining Circuits"):
+        filepath = os.path.join(BENCH_DIR, filename)
+        
+        try:
+            miter = WireFaultMiter(filepath)
+            if not miter.gates:
+                continue
+            
+            extractor = FastGraphExtractor(filepath, miter.var_map)
+            input_set = set(miter.inputs)
+            
+            for _ in range(SAMPLES_PER_FILE):
+                target_gate = random.choice(miter.gates)[0]
+                
+                # === STEP 1: Get correct solution ===
+                clauses = miter.build_miter(target_gate, None, 1)
+                cnf = CNF()
+                cnf.extend(clauses)
+                
+                with Glucose3(bootstrap_with=cnf) as solver:
+                    if not solver.solve():
+                        continue  # Skip UNSAT cases
+                    
+                    model = solver.get_model()
+                    if not model:
+                        continue
+                    
+                    base_conflicts = solver.accum_stats()['conflicts']
+                    
+                    # === STEP 2: Measure importance per input ===
+                    input_importance = {}
+                    
+                    for input_name in miter.inputs:
+                        var_id = miter.var_map[input_name]
+                        
+                        # Get the correct value from the model
+                        correct_val = var_id if var_id in model else -var_id
+                        wrong_val = -correct_val
+                        
+                        # Test: What happens if we force WRONG value?
+                        test_cnf = CNF()
+                        test_cnf.extend(clauses)
+                        
+                        with Glucose3(bootstrap_with=test_cnf) as test_solver:
+                            # Force wrong assignment
+                            result = test_solver.solve(assumptions=[wrong_val])
+                            
+                            if result:  
+                                # Still SAT with wrong value -> measure extra work
+                                wrong_conflicts = test_solver.accum_stats()['conflicts']
+                                importance = abs(wrong_conflicts - base_conflicts)
+                            else:  
+                                # UNSAT with wrong value -> this input is CRITICAL
+                                importance = 10000
+                        
+                        input_importance[input_name] = importance
+                    
+                    # Normalize importance scores to 0-1 range
+                    max_importance = max(input_importance.values()) if input_importance else 1
+                    normalized_importance = {
+                        k: v / max(max_importance, 1.0) 
+                        for k, v in input_importance.items()
+                    }
+                    
+                    # === STEP 3: Create training data ===
+                    data = extractor.get_data_for_fault(target_gate)
+                    
+                    # Prepare label tensors
+                    y_solution = torch.zeros(len(data.node_names), 1)
+                    y_importance = torch.zeros(len(data.node_names), 1)
+                    train_mask = torch.zeros(len(data.node_names), 1)
+                    
+                    # Fill in labels for input nodes only
+                    for i, node_name in enumerate(data.node_names):
+                        if node_name in input_set:
+                            var_id = miter.var_map[node_name]
+                            
+                            # Label 1: What value should this input have?
+                            y_solution[i] = 1.0 if var_id in model else 0.0
+                            
+                            # Label 2: How important is getting this right?
+                            y_importance[i] = normalized_importance.get(node_name, 0.0)
+                            
+                            # Mask: Learn from this node
+                            train_mask[i] = 1.0
+                    
+                    # Attach all labels to the data object
+                    data.y = y_solution              # What value (0 or 1)
+                    data.y_importance = y_importance # How important (0 to 1)
+                    data.train_mask = train_mask     # Which nodes to learn from
+                    data.base_conflicts = base_conflicts  # For analysis/debugging
+                    
+                    dataset.append(data)
+        
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+            continue
+    
+    print(f"--- Mining Complete. Collected {len(dataset)} samples. ---")
+    torch.save(dataset, DATASET_PATH)
+    print(f"--- Dataset saved to {DATASET_PATH} ---")
+    return dataset
+
+
+# =============================================================================
+# PART 2: MULTI-HEAD GNN MODEL (Predicts BOTH value AND importance)
+# =============================================================================
+
+class CircuitGNN_ImportanceAware(torch.nn.Module):
+    """
+    Enhanced GNN with two prediction heads:
+    1. Value head: Should this input be 0 or 1?
+    2. Importance head: How critical is this assignment?
+    """
+    
+    def __init__(self, num_node_features=14, num_layers=8, hidden_dim=64, dropout=0.2):
+        super(CircuitGNN_ImportanceAware, self).__init__()
+
+        self.dropout = dropout
+        self.num_layers = num_layers
+        
+        self.convs = torch.nn.ModuleList()
+        self.bns = torch.nn.ModuleList()
+        
+        # Input Layer
+        self.convs.append(GATv2Conv(num_node_features, hidden_dim, heads=2, concat=False))
+        self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        
+        # Hidden Layers (Residuals)
+        for _ in range(num_layers - 2):
+            self.convs.append(GATv2Conv(hidden_dim, hidden_dim, heads=2, concat=False))
+            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        
+        # Output Layer (shared representation)
+        self.convs.append(GATv2Conv(hidden_dim, 32, heads=2, concat=False))
+        self.bns.append(torch.nn.BatchNorm1d(32))
+        
+        # TWO prediction heads
+        self.value_head = torch.nn.Linear(32, 1)       # Predicts 0 or 1
+        self.importance_head = torch.nn.Linear(32, 1)  # Predicts importance score
+    
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        
+        # Shared GNN backbone
+        x = self.convs[0](x, edge_index)
+        x = self.bns[0](x)
+        x = torch.nn.functional.elu(x)
+        
+        for i in range(1, self.num_layers - 1):
+            identity = x
+            x = self.convs[i](x, edge_index)
+            x = self.bns[i](x)
+            x = torch.nn.functional.elu(x)
+            x = x + identity  # Residual
+        
+        x = self.convs[-1](x, edge_index)
+        x = self.bns[-1](x)
+        x = torch.nn.functional.elu(x)
+        
+        # Two separate predictions
+        value_logits = self.value_head(x)           # For BCE loss
+        importance_scores = self.importance_head(x)  # For MSE loss
+        
+        return value_logits, importance_scores
+
+
+# =============================================================================
+# PART 3: TRAINING WITH MULTI-TASK LOSS
+# =============================================================================
+
+def train_importance_aware_model():
+    """
+    Train model with two objectives:
+    1. Predict correct input values (BCE loss)
+    2. Predict input importance (MSE loss)
+    """
+    print("--- Training Importance-Aware Oracle ---")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    if not os.path.exists(DATASET_PATH):
+        print(f"Dataset not found at {DATASET_PATH}")
+        print("Generating dataset first...")
+        generate_importance_aware_dataset()
+    
+    # Load dataset
+    dataset = torch.load(DATASET_PATH, weights_only=False)
+    print(f"Loaded {len(dataset)} samples")
+    
+    # Train/Val split
+    split = int(len(dataset) * 0.8)
+    train_data, val_data = dataset[:split], dataset[split:]
+    
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
+    
+    # Initialize model
+    model = CircuitGNN_ImportanceAware(
+        num_node_features=14, 
+        num_layers=8, 
+        dropout=0.2
+    ).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Loss functions
+    value_criterion = nn.BCEWithLogitsLoss(reduction='none')
+    importance_criterion = nn.MSELoss(reduction='none')
+    
+    # Training loop
+    for epoch in range(EPOCHS):
+        model.train()
+        total_value_loss = 0
+        total_importance_loss = 0
+        total_combined_loss = 0
+        
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            
+            # Forward pass (two outputs)
+            value_logits, importance_preds = model(batch)
+            
+            # Loss 1: Value prediction (BCE)
+            value_loss_raw = value_criterion(value_logits, batch.y)
+            value_loss_masked = (value_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
+            
+            # Loss 2: Importance prediction (MSE)
+            importance_loss_raw = importance_criterion(importance_preds, batch.y_importance)
+            importance_loss_masked = (importance_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
+            
+            # Combined loss (weighted)
+            # Value is more important (60%) than importance ranking (40%)
+            combined_loss = 0.6 * value_loss_masked + 0.4 * importance_loss_masked
+            
+            # Backprop
+            combined_loss.backward()
+            optimizer.step()
+            
+            total_value_loss += value_loss_masked.item()
+            total_importance_loss += importance_loss_masked.item()
+            total_combined_loss += combined_loss.item()
+        
+        # Print stats
+        avg_value = total_value_loss / len(train_loader)
+        avg_importance = total_importance_loss / len(train_loader)
+        avg_combined = total_combined_loss / len(train_loader)
+        
+        print(f"Epoch {epoch+1}/{EPOCHS}:")
+        print(f"  Value Loss: {avg_value:.5f}")
+        print(f"  Importance Loss: {avg_importance:.5f}")
+        print(f"  Combined Loss: {avg_combined:.5f}")
+    
+    # Save model
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"\n--- Training Complete. Model saved to {MODEL_PATH} ---")
+
+
+# =============================================================================
+# PART 4: INFERENCE (Using importance for ranking)
+# =============================================================================
+
+def run_importance_guided_benchmark():
+    """
+    Use the trained model to guide SAT solving.
+    Now uses BOTH value predictions AND importance scores.
+    """
+
+    print(f"--- BENCHMARKING WITH IMPORTANCE-GUIDED HINTS ---")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Load model
+    model = CircuitGNN_ImportanceAware(num_node_features=14, num_layers=8).to(device)
+    if not os.path.exists(MODEL_PATH):
+        print(f"Error: {MODEL_PATH} not found. Train first!")
+        return
+    
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.to(device)
+    model.eval()
+    
+    results = []
+    files = get_target_files()
+    
+    for filename in files:
+        filepath = os.path.join(BENCH_DIR, filename)
+        print(f"\nProcessing {filename}...")
+        
+        try:
+            miter = WireFaultMiter(filepath)
+            if not miter.gates:
+                continue
+            
+            extractor = FastGraphExtractor(filepath, miter.var_map)
+            input_names = set(miter.inputs)
+            
+            for i in range(20):
+                target_gate = random.choice(miter.gates)[0]
+                
+                # Baseline SAT
+                clauses = miter.build_miter(target_gate, None, 1)
+                cnf = CNF()
+                cnf.extend(clauses)
+                
+                t_std = time.time()
+                with Glucose3(bootstrap_with=cnf) as solver:
+                    solver.solve()
+                    std_conflicts = solver.accum_stats()['conflicts']
+                std_time = time.time() - t_std
+                
+                # GNN-Guided SAT
+                t_gnn = time.time()
+                data = extractor.get_data_for_fault(target_gate)
+                if data is None:
+                    continue
+                data = data.to(device)
+                
+                with torch.no_grad():
+                    value_logits, importance_scores = model(data)
+                    value_probs = torch.sigmoid(value_logits)  # 0-1 probabilities
+                
+                # Extract hints with importance ranking
+                hints = []
+                for idx, name in enumerate(data.node_names):
+                    if name in input_names:
+                        # Value prediction
+                        prob = value_probs[idx].item()
+                        value = 1 if prob > 0.5 else -1
+                        
+                        # Importance score (how critical is this variable?)
+                        importance = importance_scores[idx].item()
+                        
+                        var_id = miter.var_map.get(name)
+                        if var_id:
+                            hints.append((var_id, value, importance))
+                
+                # Sort by IMPORTANCE (not value confidence)
+                # This is the key difference: we prioritize based on importance!
+                hints.sort(key=lambda x: x[2], reverse=True)
+                
+                # Take top K most important inputs
+                TOP_K = 5
+                top_assumptions = [h[0] * h[1] for h in hints[:TOP_K]]
+                
+                # Solve with importance-ranked assumptions
+                gnn_conflicts = 0
+                with Glucose3(bootstrap_with=cnf) as solver:
+                    if solver.solve(assumptions=top_assumptions):
+                        gnn_conflicts = solver.accum_stats()['conflicts']
+                    else:
+                        solver.solve()
+                        gnn_conflicts = solver.accum_stats()['conflicts'] + 1000
+                
+                gnn_time = time.time() - t_gnn
+                
+                # Report
+                speedup = std_conflicts / max(gnn_conflicts, 1)
+                time_speedup = std_time / max(gnn_time, 0.0001)
+                
+                print(f"   Fault: {target_gate}")
+                print(f"     Conflicts: {std_conflicts} -> {gnn_conflicts} ({speedup:.2f}x)")
+                print(f"     Time: {std_time:.4f}s -> {gnn_time:.4f}s")
+                
+                results.append({
+                    "Circuit": filename,
+                    "Fault": target_gate,
+                    "Std_Conflicts": std_conflicts,
+                    "GNN_Conflicts": gnn_conflicts,
+                    "Speedup": f"{speedup:.2f}x",
+                    "Time_Speedup": f"{time_speedup:.2f}x"
+                })
+        
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    # Save results
+    if results:
+        with open("importance_guided_results.csv", 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"\nResults saved to importance_guided_results.csv")
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python importance_pipeline.py generate  # Generate dataset")
+        print("  python importance_pipeline.py train     # Train model")
+        print("  python importance_pipeline.py benchmark # Run benchmark")
+    else:
+        command = sys.argv[1]
+        
+        if command == "generate":
+            generate_importance_aware_dataset()
+        elif command == "train":
+            train_importance_aware_model()
+        elif command == "benchmark":
+            run_importance_guided_benchmark()
+        else:
+            print(f"Unknown command: {command}")
+===== FILE: data_train_bench_mem_efficient.py =====
+"""
+Complete pipeline for importance-aware GNN training with SCOAP Observability
+This is the COMPLETE SECOND SCRIPT with 16 features (including CO and is_output)
+"""
+
+import os
+import sys
+import time
+import csv
+import math
+import torch
+import torch.nn as nn
+from torch_geometric.nn import GATv2Conv
+import torch.optim as optim
+import random
+from pysat.solvers import Glucose3
+from pysat.formula import CNF
+from tqdm import tqdm
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Dataset
+from WireFaultMiter import WireFaultMiter
+from BenchParser import BenchParser
+from torch_geometric.data import Data
+
+# =============================================================================
+# CONFIGS
+# =============================================================================
+BENCH_DIR = "../synthetic_bench"
+DATASET_PATH = "dataset_oracle_importance_16feat.pt"
+SAMPLES_PER_FILE = 50
+MODEL_PATH = "gnn_model_importance_aware_16feat.pth"
+EPOCHS = 20
+BATCH_SIZE = 32
+BENCHMARK_DIR = "../hdl-benchmarks/iscas89/bench/"
+
+# =============================================================================
+# PART 0: ENHANCED FAST GRAPH EXTRACTOR WITH OBSERVABILITY (16 FEATURES)
+# =============================================================================
+
+class FastGraphExtractor:
+    """
+    Graph extractor with FULL SCOAP (CC0, CC1, CO) and output marking
+    Produces 16-dimensional node features
+    """
+    
+    def __init__(self, bench_path, var_map=None):
+        self.parser = BenchParser(bench_path)
+        
+        if var_map is None:
+            var_map = self.parser.build_var_map()
+        self.var_map = var_map
+        
+        self.ordered_names = sorted(var_map.keys(), key=lambda k: var_map[k])
+        self.name_to_idx = {name: i for i, name in enumerate(self.ordered_names)}
+        self.num_nodes = len(self.ordered_names)
+        
+        self.edges_list = []
+        self.gate_types = {}
+        self.gate_inputs = {i: [] for i in range(self.num_nodes)}
+        self.gate_outputs = {i: [] for i in range(self.num_nodes)}
+        
+        for out, g_type, inputs in self.parser.gates:
+            self.gate_types[out] = g_type
+            if out in self.name_to_idx:
+                dst = self.name_to_idx[out]
+                for inp in inputs:
+                    if inp in self.name_to_idx:
+                        src = self.name_to_idx[inp]
+                        self.edges_list.append([src, dst])
+                        self.gate_inputs[dst].append(src)
+                        self.gate_outputs[src].append(dst)
+        
+        for ppi in self.parser.ppis:
+            if ppi in self.name_to_idx:
+                self.gate_types[ppi] = 'PPI'
+        
+        for pi in self.parser.inputs:
+            if pi not in self.gate_types and pi in self.name_to_idx:
+                self.gate_types[pi] = 'INPUT'
+        
+        self.adj = {i: [] for i in range(self.num_nodes)}
+        self.parents = {i: [] for i in range(self.num_nodes)}
+        for src, dst in self.edges_list:
+            self.adj[src].append(dst)
+            self.adj[dst].append(src)
+            self.parents[dst].append(src)
+
+        self.edge_index = torch.tensor(self.edges_list, dtype=torch.long).t().contiguous()
+        if self.edge_index.numel() == 0:
+            self.edge_index = torch.empty((2, 0), dtype=torch.long)
+        
+        self.x_base = self._build_base_features()
+    
+    def _calculate_controllability(self):
+        cc0 = {i: 1 for i in range(self.num_nodes)}
+        cc1 = {i: 1 for i in range(self.num_nodes)}
+        
+        for _ in range(50):
+            changed = False
+            for i in range(self.num_nodes):
+                inputs = self.gate_inputs[i]
+                if not inputs:
+                    continue
+                
+                name = self.ordered_names[i]
+                g_type = self.gate_types.get(name, 'INPUT')
+                
+                c0s = [cc0[x] for x in inputs]
+                c1s = [cc1[x] for x in inputs]
+                old_c0, old_c1 = cc0[i], cc1[i]
+                new_c0, new_c1 = old_c0, old_c1
+                
+                if g_type == 'AND':
+                    new_c0, new_c1 = min(c0s) + 1, sum(c1s) + 1
+                elif g_type == 'OR':
+                    new_c0, new_c1 = sum(c0s) + 1, min(c1s) + 1
+                elif g_type == 'NAND':
+                    new_c0, new_c1 = sum(c1s) + 1, min(c0s) + 1
+                elif g_type == 'NOR':
+                    new_c0, new_c1 = min(c1s) + 1, sum(c0s) + 1
+                elif g_type == 'NOT':
+                    new_c0, new_c1 = c1s[0] + 1, c0s[0] + 1
+                elif g_type == 'BUFF':
+                    new_c0, new_c1 = c0s[0] + 1, c1s[0] + 1
+                elif g_type == 'XOR':
+                    new_c0 = min(c0s[0] + c0s[1], c1s[0] + c1s[1]) + 1
+                    new_c1 = min(c0s[0] + c1s[1], c1s[0] + c0s[1]) + 1
+                
+                if new_c0 != old_c0 or new_c1 != old_c1:
+                    cc0[i] = min(new_c0, 5000)
+                    cc1[i] = min(new_c1, 5000)
+                    changed = True
+            
+            if not changed:
+                break
+        
+        return cc0, cc1
+    
+    def _calculate_observability(self):
+        co = {i: float('inf') for i in range(self.num_nodes)}
+        
+        output_set = set(self.parser.all_outputs)
+        for i, name in enumerate(self.ordered_names):
+            if name in output_set:
+                co[i] = 0
+        
+        cc0, cc1 = self._calculate_controllability()
+        
+        for _ in range(50):
+            changed = False
+            
+            for i in range(self.num_nodes):
+                fanout_gates = self.gate_outputs[i]
+                if not fanout_gates:
+                    continue
+                
+                min_co = co[i]
+                
+                for gate_idx in fanout_gates:
+                    gate_name = self.ordered_names[gate_idx]
+                    g_type = self.gate_types.get(gate_name, 'INPUT')
+                    gate_inputs = self.gate_inputs[gate_idx]
+                    
+                    gate_co = co[gate_idx]
+                    if gate_co == float('inf'):
+                        continue
+                    
+                    side_input_cost = 0
+                    
+                    if g_type in ['AND', 'NAND']:
+                        for inp_idx in gate_inputs:
+                            if inp_idx != i:
+                                side_input_cost += cc1[inp_idx]
+                    elif g_type in ['OR', 'NOR']:
+                        for inp_idx in gate_inputs:
+                            if inp_idx != i:
+                                side_input_cost += cc0[inp_idx]
+                    elif g_type in ['NOT', 'BUFF']:
+                        side_input_cost = 0
+                    elif g_type == 'XOR':
+                        for inp_idx in gate_inputs:
+                            if inp_idx != i:
+                                side_input_cost += min(cc0[inp_idx], cc1[inp_idx])
+                    
+                    path_co = gate_co + side_input_cost + 1
+                    min_co = min(min_co, path_co)
+                
+                if min_co < co[i]:
+                    co[i] = min(min_co, 5000)
+                    changed = True
+            
+            if not changed:
+                break
+        
+        for i in range(self.num_nodes):
+            if co[i] == float('inf'):
+                co[i] = 10000
+        
+        return co
+    
+    def _compute_depth(self, reverse=False):
+        adj = {i: [] for i in range(self.num_nodes)}
+        deg = {i: 0 for i in range(self.num_nodes)}
+        
+        for src, dst in self.edges_list:
+            if reverse:
+                adj[dst].append(src)
+                deg[src] += 1
+            else:
+                adj[src].append(dst)
+                deg[dst] += 1
+        
+        q = [i for i in range(self.num_nodes) if deg[i] == 0]
+        depth = {i: 0 for i in range(self.num_nodes)}
+        
+        while q:
+            n = q.pop(0)
+            for neighbor in adj[n]:
+                depth[neighbor] = max(depth[neighbor], depth[n] + 1)
+                deg[neighbor] -= 1
+                if deg[neighbor] == 0:
+                    q.append(neighbor)
+        
+        max_d = max(depth.values()) if depth else 1
+        return [depth[i] / max(max_d, 1) for i in range(self.num_nodes)]
+    
+    def _build_base_features(self):
+        """
+        16-dimensional features:
+        [0-7]: Gate type one-hot
+        [8-9]: Forward/backward depth
+        [10-11]: Fault target and distance (set per-fault)
+        [12-13]: SCOAP CC0, CC1
+        [14]: SCOAP CO (observability)
+        [15]: Is output node
+        """
+        types = ['INPUT', 'NAND', 'AND', 'NOR', 'OR', 'NOT', 'BUFF', 'XOR']
+        t_map = {t: i for i, t in enumerate(types)}
+        
+        fwd = self._compute_depth(False)
+        rev = self._compute_depth(True)
+        cc0, cc1 = self._calculate_controllability()
+        co = self._calculate_observability()
+        
+        x = torch.zeros((self.num_nodes, 16), dtype=torch.float)
+        
+        output_set = set(self.parser.all_outputs)
+        
+        for i, name in enumerate(self.ordered_names):
+            g_type = self.gate_types.get(name, 'INPUT')
+            if g_type in t_map:
+                x[i, t_map[g_type]] = 1.0
+            
+            x[i, 8] = fwd[i]
+            x[i, 9] = rev[i]
+            x[i, 12] = math.log(cc0[i] + 1) / 10.0
+            x[i, 13] = math.log(cc1[i] + 1) / 10.0
+            x[i, 14] = math.log(co[i] + 1) / 10.0
+            
+            if name in output_set:
+                x[i, 15] = 1.0
+        
+        return x
+    
+    def get_data_for_fault(self, fault_name):
+        x = self.x_base.clone()
+        
+        tid = self.name_to_idx.get(fault_name)
+        if tid is not None:
+            x[tid, 10] = 1.0
+            
+            q = [tid]
+            dist = {i: -1 for i in range(self.num_nodes)}
+            dist[tid] = 0
+            
+            while q:
+                n = q.pop(0)
+                if dist[n] >= 10:
+                    continue
+                for neighbor in self.adj[n]:
+                    if dist[neighbor] == -1:
+                        dist[neighbor] = dist[n] + 1
+                        q.append(neighbor)
+            
+            max_d = max(dist.values()) if dist else 1
+            for i in range(self.num_nodes):
+                if dist[i] != -1:
+                    x[i, 11] = 1.0 - (dist[i] / max(max_d, 1))
+        
+        data = Data(x=x, edge_index=self.edge_index)
+        data.node_names = self.ordered_names
+        
+        return data
+
+
+# =============================================================================
+# PART 1: DATA GENERATION WITH IMPORTANCE
+# =============================================================================
+
+def get_target_files():
+    if not os.path.exists(BENCHMARK_DIR):
+        return []
+    return [f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")]
+
+
+def generate_importance_aware_dataset():
+    """
+    Generate dataset with importance labels
+    Uses 16-feature extractor with observability
+    """
+    print(f"--- MINING IMPORTANCE-AWARE ORACLE DATA (16 Features) ---")
+    dataset = []
+    
+    if not os.path.exists(BENCH_DIR):
+        print(f"Error: {BENCH_DIR} not found.")
+        return
+    
+    files = [f for f in os.listdir(BENCH_DIR) if f.endswith('.bench')]
+    
+    for filename in tqdm(files, desc="Mining Circuits"):
+        filepath = os.path.join(BENCH_DIR, filename)
+        
+        try:
+            miter = WireFaultMiter(filepath)
+            if not miter.gates:
+                continue
+            
+            extractor = FastGraphExtractor(filepath, miter.var_map)
+            input_set = set(miter.inputs)
+            
+            for _ in range(SAMPLES_PER_FILE):
+                target_gate = random.choice(miter.gates)[0]
+                
+                clauses = miter.build_miter(target_gate, None, 1)
+                cnf = CNF()
+                cnf.extend(clauses)
+                
+                with Glucose3(bootstrap_with=cnf) as solver:
+                    if not solver.solve():
+                        continue
+                    
+                    model = solver.get_model()
+                    if not model:
+                        continue
+                    
+                    base_conflicts = solver.accum_stats()['conflicts']
+                    
+                    input_importance = {}
+                    
+                    for input_name in miter.inputs:
+                        var_id = miter.var_map[input_name]
+                        correct_val = var_id if var_id in model else -var_id
+                        wrong_val = -correct_val
+                        
+                        test_cnf = CNF()
+                        test_cnf.extend(clauses)
+                        
+                        with Glucose3(bootstrap_with=test_cnf) as test_solver:
+                            result = test_solver.solve(assumptions=[wrong_val])
+                            
+                            if result:
+                                wrong_conflicts = test_solver.accum_stats()['conflicts']
+                                importance = abs(wrong_conflicts - base_conflicts)
+                            else:
+                                importance = 10000
+                        
+                        input_importance[input_name] = importance
+                    
+                    max_importance = max(input_importance.values()) if input_importance else 1
+                    normalized_importance = {
+                        k: v / max(max_importance, 1.0) 
+                        for k, v in input_importance.items()
+                    }
+                    
+                    data = extractor.get_data_for_fault(target_gate)
+                    
+                    y_solution = torch.zeros(len(data.node_names), 1)
+                    y_importance = torch.zeros(len(data.node_names), 1)
+                    train_mask = torch.zeros(len(data.node_names), 1)
+                    
+                    for i, node_name in enumerate(data.node_names):
+                        if node_name in input_set:
+                            var_id = miter.var_map[node_name]
+                            y_solution[i] = 1.0 if var_id in model else 0.0
+                            y_importance[i] = normalized_importance.get(node_name, 0.0)
+                            train_mask[i] = 1.0
+                    
+                    data.y = y_solution
+                    data.y_importance = y_importance
+                    data.train_mask = train_mask
+                    data.base_conflicts = base_conflicts
+                    
+                    dataset.append(data)
+        
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+            continue
+    
+    print(f"--- Mining Complete. Collected {len(dataset)} samples. ---")
+    torch.save(dataset, DATASET_PATH)
+    print(f"--- Dataset saved to {DATASET_PATH} ---")
+    return dataset
+
+
+# =============================================================================
+# PART 2: GNN MODEL WITH 16 FEATURES
+# =============================================================================
+
+class CircuitGNN_ImportanceAware(torch.nn.Module):
+    """
+    GNN with two prediction heads for 16-feature inputs
+    """
+    
+    def __init__(self, num_node_features=16, num_layers=8, hidden_dim=64, dropout=0.2):
+        super(CircuitGNN_ImportanceAware, self).__init__()
+        
+        self.dropout = dropout
+        self.num_layers = num_layers
+        
+        self.convs = torch.nn.ModuleList()
+        self.bns = torch.nn.ModuleList()
+        
+        self.convs.append(GATv2Conv(num_node_features, hidden_dim, heads=2, concat=False))
+        self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        
+        for _ in range(num_layers - 2):
+            self.convs.append(GATv2Conv(hidden_dim, hidden_dim, heads=2, concat=False))
+            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        
+        self.convs.append(GATv2Conv(hidden_dim, 32, heads=2, concat=False))
+        self.bns.append(torch.nn.BatchNorm1d(32))
+        
+        self.value_head = torch.nn.Linear(32, 1)
+        self.importance_head = torch.nn.Linear(32, 1)
+    
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        
+        x = self.convs[0](x, edge_index)
+        x = self.bns[0](x)
+        x = torch.nn.functional.elu(x)
+        
+        for i in range(1, self.num_layers - 1):
+            identity = x
+            x = self.convs[i](x, edge_index)
+            x = self.bns[i](x)
+            x = torch.nn.functional.elu(x)
+            x = x + identity
+        
+        x = self.convs[-1](x, edge_index)
+        x = self.bns[-1](x)
+        x = torch.nn.functional.elu(x)
+        
+        value_logits = self.value_head(x)
+        importance_scores = self.importance_head(x)
+        
+        return value_logits, importance_scores
+
+
+# =============================================================================
+# PART 3: TRAINING
+# =============================================================================
+
+def train_importance_aware_model():
+    """Train model with 16-feature graphs"""
+    print("--- Training Importance-Aware Oracle (16 Features) ---")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    if not os.path.exists(DATASET_PATH):
+        print(f"Dataset not found at {DATASET_PATH}")
+        print("Generating dataset first...")
+        generate_importance_aware_dataset()
+    
+    dataset = torch.load(DATASET_PATH, weights_only=False)
+    print(f"Loaded {len(dataset)} samples")
+    
+    split = int(len(dataset) * 0.8)
+    train_data, val_data = dataset[:split], dataset[split:]
+    
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
+    
+    model = CircuitGNN_ImportanceAware(
+        num_node_features=16,
+        num_layers=8,
+        dropout=0.2
+    ).to(device)
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    value_criterion = nn.BCEWithLogitsLoss(reduction='none')
+    importance_criterion = nn.MSELoss(reduction='none')
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        total_value_loss = 0
+        total_importance_loss = 0
+        total_combined_loss = 0
+        
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            
+            value_logits, importance_preds = model(batch)
+            
+            value_loss_raw = value_criterion(value_logits, batch.y)
+            value_loss_masked = (value_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
+            
+            importance_loss_raw = importance_criterion(importance_preds, batch.y_importance)
+            importance_loss_masked = (importance_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
+            
+            combined_loss = 0.6 * value_loss_masked + 0.4 * importance_loss_masked
+            
+            combined_loss.backward()
+            optimizer.step()
+            
+            total_value_loss += value_loss_masked.item()
+            total_importance_loss += importance_loss_masked.item()
+            total_combined_loss += combined_loss.item()
+        
+        avg_value = total_value_loss / len(train_loader)
+        avg_importance = total_importance_loss / len(train_loader)
+        avg_combined = total_combined_loss / len(train_loader)
+        
+        print(f"Epoch {epoch+1}/{EPOCHS}:")
+        print(f"  Value Loss: {avg_value:.5f}")
+        print(f"  Importance Loss: {avg_importance:.5f}")
+        print(f"  Combined Loss: {avg_combined:.5f}")
+    
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"\n--- Training Complete. Model saved to {MODEL_PATH} ---")
+
+
+# =============================================================================
+# PART 4: BENCHMARKING
+# =============================================================================
+
+def run_importance_guided_benchmark():
+    """Benchmark with importance-guided SAT solving"""
+    print(f"--- BENCHMARKING WITH IMPORTANCE-GUIDED HINTS (16 Features) ---")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    model = CircuitGNN_ImportanceAware(num_node_features=16, num_layers=8).to(device)
+    if not os.path.exists(MODEL_PATH):
+        print(f"Error: {MODEL_PATH} not found. Train first!")
+        return
+    
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.to(device)
+    model.eval()
+    
+    results = []
+    files = get_target_files()
+    
+    for filename in files:
+        filepath = os.path.join(BENCHMARK_DIR, filename)
+        print(f"\nProcessing {filename}...")
+        
+        try:
+            miter = WireFaultMiter(filepath)
+            if not miter.gates:
+                continue
+            
+            extractor = FastGraphExtractor(filepath, miter.var_map)
+            input_names = set(miter.inputs)
+            
+            for i in range(20):
+                target_gate = random.choice(miter.gates)[0]
+                
+                clauses = miter.build_miter(target_gate, None, 1)
+                cnf = CNF()
+                cnf.extend(clauses)
+                
+                t_std = time.time()
+                with Glucose3(bootstrap_with=cnf) as solver:
+                    solver.solve()
+                    std_conflicts = solver.accum_stats()['conflicts']
+                std_time = time.time() - t_std
+                
+                t_gnn = time.time()
+                data = extractor.get_data_for_fault(target_gate)
+                if data is None:
+                    continue
+                data = data.to(device)
+                
+                with torch.no_grad():
+                    value_logits, importance_scores = model(data)
+                    value_probs = torch.sigmoid(value_logits)
+                
+                hints = []
+                for idx, name in enumerate(data.node_names):
+                    if name in input_names:
+                        prob = value_probs[idx].item()
+                        value = 1 if prob > 0.5 else -1
+                        importance = importance_scores[idx].item()
+                        
+                        var_id = miter.var_map.get(name)
+                        if var_id:
+                            hints.append((var_id, value, importance))
+                
+                hints.sort(key=lambda x: x[2], reverse=True)
+                
+                TOP_K = 5
+                top_assumptions = [h[0] * h[1] for h in hints[:TOP_K]]
+                
+                gnn_conflicts = 0
+                with Glucose3(bootstrap_with=cnf) as solver:
+                    if solver.solve(assumptions=top_assumptions):
+                        gnn_conflicts = solver.accum_stats()['conflicts']
+                    else:
+                        solver.solve()
+                        gnn_conflicts = solver.accum_stats()['conflicts'] + 1000
+                
+                gnn_time = time.time() - t_gnn
+                
+                speedup = std_conflicts / max(gnn_conflicts, 1)
+                time_speedup = std_time / max(gnn_time, 0.0001)
+                
+                print(f"   Fault: {target_gate}")
+                print(f"     Conflicts: {std_conflicts} -> {gnn_conflicts} ({speedup:.2f}x)")
+                print(f"     Time: {std_time:.4f}s -> {gnn_time:.4f}s")
+                
+                results.append({
+                    "Circuit": filename,
+                    "Fault": target_gate,
+                    "Std_Conflicts": std_conflicts,
+                    "GNN_Conflicts": gnn_conflicts,
+                    "Speedup": f"{speedup:.2f}x",
+                    "Time_Speedup": f"{time_speedup:.2f}x"
+                })
+        
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    if results:
+        with open("importance_guided_results_16feat.csv", 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"\nResults saved to importance_guided_results_16feat.csv")
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python importance_pipeline_16feat.py generate  # Generate dataset")
+        print("  python importance_pipeline_16feat.py train     # Train model")
+        print("  python importance_pipeline_16feat.py benchmark # Run benchmark")
+        print("\nFeatures: 16-dimensional with SCOAP observability")
+    else:
+        command = sys.argv[1]
+        
+        if command == "generate":
+            generate_importance_aware_dataset()
+        elif command == "train":
+            train_importance_aware_model()
+        elif command == "benchmark":
+            run_importance_guided_benchmark()
+        else:
+            print(f"Unknown command: {command}")
+===== FILE: neuro_utils.py =====
+"""
+Enhanced FastGraphExtractor with full SCOAP metrics:
+- Controllability (CC0, CC1): How hard to set a signal to 0 or 1
+- Observability (CO): How hard to observe a signal at outputs
+
+Observability is critical for fault detection - it measures how easily
+a fault on a wire can propagate to an observable output.
+"""
+import torch
+import math
+from torch_geometric.data import Data
+from BenchParser import BenchParser
+
+class FastGraphExtractor:
+    """
+    SCOAP-Complete Graph Extractor with Controllability AND Observability
+    """
+    
+    def __init__(self, bench_path, var_map=None):
+        self.parser = BenchParser(bench_path)
+        
+        if var_map is None:
+            var_map = self.parser.build_var_map()
+        self.var_map = var_map
+        
+        self.ordered_names = sorted(var_map.keys(), key=lambda k: var_map[k])
+        self.name_to_idx = {name: i for i, name in enumerate(self.ordered_names)}
+        self.num_nodes = len(self.ordered_names)
+        
+        # Build edge list and gate information
+        self.edges_list = []
+        self.gate_types = {}
+        self.gate_inputs = {i: [] for i in range(self.num_nodes)}
+        self.gate_outputs = {i: [] for i in range(self.num_nodes)}  # NEW: Track fanout
+        
+        for out, g_type, inputs in self.parser.gates:
+            self.gate_types[out] = g_type
+            if out in self.name_to_idx:
+                dst = self.name_to_idx[out]
+                for inp in inputs:
+                    if inp in self.name_to_idx:
+                        src = self.name_to_idx[inp]
+                        self.edges_list.append([src, dst])
+                        self.gate_inputs[dst].append(src)
+                        self.gate_outputs[src].append(dst)  # Track fanout
+        
+        # Mark PPIs (DFF outputs)
+        for ppi in self.parser.ppis:
+            if ppi in self.name_to_idx:
+                self.gate_types[ppi] = 'PPI'
+        
+        # Mark PIs
+        for pi in self.parser.inputs:
+            if pi not in self.gate_types and pi in self.name_to_idx:
+                self.gate_types[pi] = 'INPUT'
+        
+        # Build adjacency
+        self.adj = {i: [] for i in range(self.num_nodes)}
+        self.parents = {i: [] for i in range(self.num_nodes)}
+        for src, dst in self.edges_list:
+            self.adj[src].append(dst)
+            self.adj[dst].append(src)
+            self.parents[dst].append(src)
+
+        self.edge_index = torch.tensor(self.edges_list, dtype=torch.long).t().contiguous()
+        if self.edge_index.numel() == 0:
+            self.edge_index = torch.empty((2, 0), dtype=torch.long)
+        
+        self.x_base = self._build_base_features()
+    
+    def _calculate_controllability(self):
+        """
+        Calculate SCOAP Controllability (CC0, CC1)
+        
+        CC0(wire): Minimum # of input assignments needed to set wire to 0
+        CC1(wire): Minimum # of input assignments needed to set wire to 1
+        
+        Algorithm: Forward propagation from inputs
+        """
+        cc0 = {i: 1 for i in range(self.num_nodes)}
+        cc1 = {i: 1 for i in range(self.num_nodes)}
+        
+        for _ in range(50):  # Iterate until convergence
+            changed = False
+            for i in range(self.num_nodes):
+                inputs = self.gate_inputs[i]
+                if not inputs:
+                    continue
+                
+                name = self.ordered_names[i]
+                g_type = self.gate_types.get(name, 'INPUT')
+                
+                c0s = [cc0[x] for x in inputs]
+                c1s = [cc1[x] for x in inputs]
+                old_c0, old_c1 = cc0[i], cc1[i]
+                new_c0, new_c1 = old_c0, old_c1
+                
+                # SCOAP Controllability Rules
+                if g_type == 'AND':
+                    # To get 0: make ANY input 0 (minimum)
+                    # To get 1: make ALL inputs 1 (sum)
+                    new_c0 = min(c0s) + 1
+                    new_c1 = sum(c1s) + 1
+                    
+                elif g_type == 'OR':
+                    # To get 0: make ALL inputs 0 (sum)
+                    # To get 1: make ANY input 1 (minimum)
+                    new_c0 = sum(c0s) + 1
+                    new_c1 = min(c1s) + 1
+                    
+                elif g_type == 'NAND':
+                    # NAND = NOT(AND)
+                    new_c0 = sum(c1s) + 1  # To get 0: all inputs 1
+                    new_c1 = min(c0s) + 1  # To get 1: any input 0
+                    
+                elif g_type == 'NOR':
+                    # NOR = NOT(OR)
+                    new_c0 = min(c1s) + 1  # To get 0: any input 1
+                    new_c1 = sum(c0s) + 1  # To get 1: all inputs 0
+                    
+                elif g_type == 'NOT':
+                    # Inverts controllability
+                    new_c0 = c1s[0] + 1
+                    new_c1 = c0s[0] + 1
+                    
+                elif g_type == 'BUFF':
+                    # Passes through
+                    new_c0 = c0s[0] + 1
+                    new_c1 = c1s[0] + 1
+                    
+                elif g_type == 'XOR':
+                    # XOR is 1 when inputs differ
+                    new_c0 = min(c0s[0] + c0s[1], c1s[0] + c1s[1]) + 1
+                    new_c1 = min(c0s[0] + c1s[1], c1s[0] + c0s[1]) + 1
+                
+                if new_c0 != old_c0 or new_c1 != old_c1:
+                    cc0[i] = min(new_c0, 5000)
+                    cc1[i] = min(new_c1, 5000)
+                    changed = True
+            
+            if not changed:
+                break
+        
+        return cc0, cc1
+    
+    def _calculate_observability(self):
+        """
+        Calculate SCOAP Observability (CO)
+        
+        CO(wire): Minimum # of additional inputs needed to observe wire at outputs
+        
+        Algorithm: Backward propagation from outputs
+        
+        Key insight: A wire is easier to observe if:
+        1. It's directly an output (CO = 0)
+        2. It feeds gates that are easy to observe
+        3. It doesn't require many side inputs to propagate
+        """
+        co = {i: float('inf') for i in range(self.num_nodes)}
+        
+        # Initialize outputs with CO = 0
+        output_set = set(self.parser.all_outputs)
+        for i, name in enumerate(self.ordered_names):
+            if name in output_set:
+                co[i] = 0
+        
+        # Get controllability for side input calculations
+        cc0, cc1 = self._calculate_controllability()
+        
+        # Backward propagation (multiple iterations)
+        for _ in range(50):
+            changed = False
+            
+            for i in range(self.num_nodes):
+                # For each node, check all gates it feeds into
+                fanout_gates = self.gate_outputs[i]
+                if not fanout_gates:
+                    continue
+                
+                name = self.ordered_names[i]
+                
+                # Find minimum observability through any fanout path
+                min_co = co[i]
+                
+                for gate_idx in fanout_gates:
+                    gate_name = self.ordered_names[gate_idx]
+                    g_type = self.gate_types.get(gate_name, 'INPUT')
+                    gate_inputs = self.gate_inputs[gate_idx]
+                    
+                    # CO at this input = CO at gate output + side input controllability
+                    gate_co = co[gate_idx]
+                    if gate_co == float('inf'):
+                        continue
+                    
+                    # Calculate side input contribution
+                    side_input_cost = 0
+                    
+                    if g_type in ['AND', 'NAND']:
+                        # To propagate through AND/NAND: other inputs must be 1
+                        for inp_idx in gate_inputs:
+                            if inp_idx != i:  # Side inputs
+                                side_input_cost += cc1[inp_idx]
+                    
+                    elif g_type in ['OR', 'NOR']:
+                        # To propagate through OR/NOR: other inputs must be 0
+                        for inp_idx in gate_inputs:
+                            if inp_idx != i:
+                                side_input_cost += cc0[inp_idx]
+                    
+                    elif g_type in ['NOT', 'BUFF']:
+                        # No side inputs needed
+                        side_input_cost = 0
+                    
+                    elif g_type == 'XOR':
+                        # XOR: need to control other input (either 0 or 1, take min)
+                        for inp_idx in gate_inputs:
+                            if inp_idx != i:
+                                side_input_cost += min(cc0[inp_idx], cc1[inp_idx])
+                    
+                    # Total observability through this path
+                    path_co = gate_co + side_input_cost + 1
+                    min_co = min(min_co, path_co)
+                
+                if min_co < co[i]:
+                    co[i] = min(min_co, 5000)
+                    changed = True
+            
+            if not changed:
+                break
+        
+        # Handle unreachable nodes (no path to outputs)
+        for i in range(self.num_nodes):
+            if co[i] == float('inf'):
+                co[i] = 10000  # Very high cost
+        
+        return co
+    
+    def _compute_depth(self, reverse=False):
+        """Compute topological depth"""
+        adj = {i: [] for i in range(self.num_nodes)}
+        deg = {i: 0 for i in range(self.num_nodes)}
+        
+        for src, dst in self.edges_list:
+            if reverse:
+                adj[dst].append(src)
+                deg[src] += 1
+            else:
+                adj[src].append(dst)
+                deg[dst] += 1
+        
+        q = [i for i in range(self.num_nodes) if deg[i] == 0]
+        depth = {i: 0 for i in range(self.num_nodes)}
+        
+        while q:
+            n = q.pop(0)
+            for neighbor in adj[n]:
+                depth[neighbor] = max(depth[neighbor], depth[n] + 1)
+                deg[neighbor] -= 1
+                if deg[neighbor] == 0:
+                    q.append(neighbor)
+        
+        max_d = max(depth.values()) if depth else 1
+        return [depth[i] / max(max_d, 1) for i in range(self.num_nodes)]
+    
+    def _build_base_features(self):
+        """
+        Build base features with FULL SCOAP metrics
+        
+        Feature dimensions (EXPANDED to 16):
+        [0-7]: Gate type one-hot (INPUT, NAND, AND, NOR, OR, NOT, BUFF, XOR)
+        [8]: Forward depth (normalized)
+        [9]: Backward depth (normalized)
+        [10]: Is fault target (set per-fault)
+        [11]: Distance from fault (set per-fault)
+        [12]: SCOAP CC0 - Controllability to 0 (log normalized)
+        [13]: SCOAP CC1 - Controllability to 1 (log normalized)
+        [14]: SCOAP CO - Observability (log normalized) ← NEW!
+        [15]: Is output node (1.0 if observable) ← NEW!
+        """
+        types = ['INPUT', 'NAND', 'AND', 'NOR', 'OR', 'NOT', 'BUFF', 'XOR']
+        t_map = {t: i for i, t in enumerate(types)}
+        
+        fwd = self._compute_depth(False)
+        rev = self._compute_depth(True)
+        cc0, cc1 = self._calculate_controllability()
+        co = self._calculate_observability()  # NEW!
+        
+        # EXPANDED feature matrix: 14 -> 16 dimensions
+        x = torch.zeros((self.num_nodes, 16), dtype=torch.float)
+        
+        output_set = set(self.parser.all_outputs)
+        
+        for i, name in enumerate(self.ordered_names):
+            # Gate type
+            g_type = self.gate_types.get(name, 'INPUT')
+            if g_type in t_map:
+                x[i, t_map[g_type]] = 1.0
+            
+            # Depth features
+            x[i, 8] = fwd[i]
+            x[i, 9] = rev[i]
+            
+            # SCOAP Controllability (log normalized)
+            x[i, 12] = math.log(cc0[i] + 1) / 10.0
+            x[i, 13] = math.log(cc1[i] + 1) / 10.0
+            
+            # SCOAP Observability (log normalized) - NEW!
+            x[i, 14] = math.log(co[i] + 1) / 10.0
+            
+            # Output marking - NEW!
+            if name in output_set:
+                x[i, 15] = 1.0
+        
+        return x
+    
+    def get_data_for_fault(self, fault_name):
+        """
+        Build graph data for a specific fault.
+        
+        Marks:
+        - Fault target wire (feature [10] = 1.0)
+        - Distance from fault (feature [11] = normalized distance)
+        """
+        x = self.x_base.clone()
+        
+        # Mark fault target
+        tid = self.name_to_idx.get(fault_name)
+        if tid is not None:
+            x[tid, 10] = 1.0
+            
+            # Compute distance from fault via BFS
+            q = [tid]
+            dist = {i: -1 for i in range(self.num_nodes)}
+            dist[tid] = 0
+            
+            while q:
+                n = q.pop(0)
+                if dist[n] >= 10:
+                    continue
+                for neighbor in self.adj[n]:
+                    if dist[neighbor] == -1:
+                        dist[neighbor] = dist[n] + 1
+                        q.append(neighbor)
+            
+            # Normalize distances
+            max_d = max(dist.values()) if dist else 1
+            for i in range(self.num_nodes):
+                if dist[i] != -1:
+                    x[i, 11] = 1.0 - (dist[i] / max(max_d, 1))
+        
+        # Create data object
+        data = Data(x=x, edge_index=self.edge_index)
+        data.node_names = self.ordered_names
+        
+        return data
+    
+    def analyze_scoap(self, wire_name):
+        """Debug helper: Show SCOAP metrics for a wire"""
+        if wire_name not in self.name_to_idx:
+            print(f"Wire {wire_name} not found")
+            return
+        
+        idx = self.name_to_idx[wire_name]
+        features = self.x_base[idx]
+        
+        cc0_raw = math.exp(features[12].item() * 10.0) - 1
+        cc1_raw = math.exp(features[13].item() * 10.0) - 1
+        co_raw = math.exp(features[14].item() * 10.0) - 1
+        
+        print(f"\n=== SCOAP Analysis for {wire_name} ===")
+        print(f"Controllability CC0: {cc0_raw:.1f} (effort to set to 0)")
+        print(f"Controllability CC1: {cc1_raw:.1f} (effort to set to 1)")
+        print(f"Observability CO:    {co_raw:.1f} (effort to observe at outputs)")
+        print(f"Is Output: {features[15].item() == 1.0}")
+        
+        # Testability interpretation
+        total_test_0 = cc0_raw + co_raw
+        total_test_1 = cc1_raw + co_raw
+        
+        print(f"\nTestability (lower = easier to test):")
+        print(f"  Stuck-at-0 fault: {total_test_0:.1f}")
+        print(f"  Stuck-at-1 fault: {total_test_1:.1f}")
+        
+        if total_test_0 < 10 and total_test_1 < 10:
+            print("  → Easy to test")
+        elif total_test_0 > 100 or total_test_1 > 100:
+            print("  → Hard to test (may need many patterns)")
+        else:
+            print("  → Moderate difficulty")
+
+
+# ==============================================================================
+# TEST AND COMPARISON
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+    
+    # Test file
+    bench_file = "../hdl-benchmarks/iscas89/bench/c1908.bench"
+    
+    print("="*70)
+    print("Testing SCOAP with Observability")
+    print("="*70)
+    
+    extractor = FastGraphExtractor(bench_file)
+    
+    print(f"\nCircuit loaded:")
+    print(f"  Nodes: {extractor.num_nodes}")
+    print(f"  Edges: {len(extractor.edges_list)}")
+    print(f"  Outputs: {len(extractor.parser.all_outputs)}")
+    print(f"  Feature dimensions: {extractor.x_base.shape[1]}")
+    
+    # Analyze some wires
+    print("\n" + "="*70)
+    print("SCOAP Analysis Examples")
+    print("="*70)
+    
+    # Analyze an input
+    if extractor.parser.inputs:
+        input_wire = extractor.parser.inputs[0]
+        extractor.analyze_scoap(input_wire)
+    
+    # Analyze an output
+    if extractor.parser.outputs:
+        output_wire = extractor.parser.outputs[0]
+        extractor.analyze_scoap(output_wire)
+    
+    # Analyze a random internal gate
+    if extractor.parser.gates:
+        internal_wire = extractor.parser.gates[len(extractor.parser.gates)//2][0]
+        extractor.analyze_scoap(internal_wire)
+    
+    # Compare observability across all nodes
+    print("\n" + "="*70)
+    print("Observability Distribution")
+    print("="*70)
+    
+    co_values = []
+    for i in range(extractor.num_nodes):
+        co_norm = extractor.x_base[i, 14].item()
+        co_raw = math.exp(co_norm * 10.0) - 1
+        co_values.append(co_raw)
+    
+    co_values.sort()
+    
+    print(f"Most observable (easiest to test):")
+    for i in range(min(5, len(co_values))):
+        print(f"  CO = {co_values[i]:.1f}")
+    
+    print(f"\nLeast observable (hardest to test):")
+    for i in range(max(0, len(co_values)-5), len(co_values)):
+        print(f"  CO = {co_values[i]:.1f}")
+    
+    print(f"\nMedian observability: {co_values[len(co_values)//2]:.1f}")

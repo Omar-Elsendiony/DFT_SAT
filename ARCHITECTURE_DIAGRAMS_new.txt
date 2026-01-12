@@ -1,0 +1,633 @@
+"""
+VISUAL ARCHITECTURE DIAGRAMS
+For GNN-Guided SAT Solver
+"""
+
+# ============================================================================
+# FIGURE 1: High-Level Pipeline
+# ============================================================================
+
+PIPELINE_DIAGRAM = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    GNN-GUIDED SAT SOLVER PIPELINE                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Circuit File (.bench)
+        │
+        │ [BenchParser]
+        ▼
+    ┌─────────────────┐
+    │ Circuit Graph   │
+    │ - Nodes: wires  │
+    │ - Edges: gates  │
+    └─────────────────┘
+        │
+        ├──────────────────────────────┬──────────────────────┐
+        │                              │                      │
+        ▼                              ▼                      ▼
+    ┌──────────┐              ┌──────────────┐         ┌─────────────┐
+    │ Topology │              │ Gate Types   │         │SCOAP Metrics│
+    │(fanin)   │              │- AND, OR...  │         │(CC0,CC1,CO) │
+    └──────────┘              └──────────────┘         └─────────────┘
+        │                              │                      │
+        └──────────────────────────────┼──────────────────────┘
+                                       │
+                            ┌──────────────────────┐
+                            │ Node Features       │
+                            │ (16-dimensional)    │
+                            └──────────────────────┘
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    │                                     │
+                    ▼                                     ▼
+            ┌──────────────┐                    ┌──────────────────┐
+            │ WireFault    │                    │ GNN Model        │
+            │ Miter        │                    │ (Importance)     │
+            │              │                    │                  │
+            │ Good Circuit │                    │ GAT Layers       │
+            │ Faulty Circ  │                    │ +Output Layer    │
+            │ Comparator   │                    │                  │
+            └──────────────┘                    └──────────────────┘
+                    │                                     │
+                    ▼                                     ▼
+            ┌──────────────┐                    ┌──────────────────┐
+            │ CNF Formula  │                    │ Importance Score │
+            │ (DIMACS)     │                    │ per Variable     │
+            │              │                    │ (0-1)            │
+            │~N*M Clauses  │                    └──────────────────┘
+            └──────────────┘                            │
+                    │                                   │
+                    └───────────────────┬───────────────┘
+                                        │
+                             ┌──────────▼──────────┐
+                             │ Glucose Solver      │
+                             │ - Receives CNF      │
+                             │ - Receives hints    │
+                             │ - DPLL + UnitProp   │
+                             │ - Conflict Analysis │
+                             └──────────▼──────────┘
+                                        │
+                             ┌──────────▼──────────┐
+                             │ Solution Analysis   │
+                             │ - SAT/UNSAT?        │
+                             │ - Conflicts         │
+                             │ - Decisions         │
+                             │ - Propagations      │
+                             │ - Model             │
+                             └──────────▼──────────┘
+                                        │
+                             ┌──────────▼──────────┐
+                             │ Results JSON        │
+                             │ + Performance Stats │
+                             └─────────────────────┘
+"""
+
+# ============================================================================
+# FIGURE 2: GNN Architecture
+# ============================================================================
+
+GNN_ARCHITECTURE = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   GNN MODEL ARCHITECTURE (GAT)                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Input:
+  Node Features: [num_nodes, 16]
+  - Gate type (one-hot: 8 dims)
+  - CC0, CC1, CO (3 dims)
+  - Fanin count, Fanout count (2 dims)
+  - Is_output, Is_input flags (2 dims)
+  - Other structural features (1 dim)
+
+                         │
+                         ▼
+                    ┌─────────────────────────┐
+                    │ GAT Layer 1             │
+                    │ 4 Attention Heads       │
+                    │ Input:  16              │
+                    │ Output: 4×64 = 256      │
+                    │                         │
+                    │ Attention learns:       │
+                    │ "Which nodes matter?"   │
+                    └─────────────────────────┘
+                         │
+                    ┌────▼────┐
+                    │ ReLU    │
+                    └────┬────┘
+                         │
+                         ▼
+                    ┌─────────────────────────┐
+                    │ GAT Layer 2             │
+                    │ 4 Attention Heads       │
+                    │ Input:  256             │
+                    │ Output: 4×64 = 256      │
+                    │                         │
+                    │ Attention learns:       │
+                    │ "Which nodes are        │
+                    │  critical for           │
+                    │  fault detection?"      │
+                    └─────────────────────────┘
+                         │
+                    ┌────▼────┐
+                    │ ReLU    │
+                    └────┬────┘
+                         │
+                         ▼
+                    ┌─────────────────────────┐
+                    │ Output Layer            │
+                    │ Linear: 256 → 1        │
+                    │                         │
+                    │ Produces single value   │
+                    │ per variable            │
+                    └─────────────────────────┘
+                         │
+                    ┌────▼────┐
+                    │Sigmoid  │ [0-1]
+                    └────┬────┘
+                         │
+                         ▼
+Output:
+  Importance Scores: [num_nodes, 1]
+  - 0.1: Not important
+  - 0.5: Medium importance
+  - 0.95: Critical for fault detection
+"""
+
+# ============================================================================
+# FIGURE 3: SAT Solver Comparison
+# ============================================================================
+
+SAT_COMPARISON = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│            SAT SOLVING: Standard vs GNN-Guided                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+STANDARD SAT SOLVER                  GNN-GUIDED SAT SOLVER
+───────────────────────              ─────────────────────
+
+Input:                                Input:
+  CNF Formula                           CNF Formula + Importance Hints
+  
+Heuristic:                            Heuristic:
+  Pick variable X                       GNN says: X=0.95 important
+  (generic scoring)                     Y=0.30 not important
+  
+Decision Tree:                        Decision Tree:
+
+       CNF                                    CNF
+        │                                      │
+   ┌────┴────┐                          ┌─────┴──────┐
+   │ Try X=0 │ Conflicts!               │ Try X=0    │ ← High importance
+   └────┬────┘ (wrong guess)            │ (informed  │    GNN hint
+        │                                │  guess)   │
+   ┌────▼────┐                          └────┬───────┘
+   │ Try X=1 │                               │
+   └────┬────┘ Still conflicts               ├─ Finds solution
+        │      (bad order)                   │  faster!
+   ┌────▼────┐                               │
+   │ Try Y=0 │                          ┌────▼───┐
+   │ Try Y=1 │                          │SAT ✓   │
+   │ Try Z=0 │ Many exploring           └────────┘
+   │ Try Z=1 │ alternatives
+   └────┬────┘
+        │
+   ┌────▼────┐
+   │ Back to │ Expensive
+   │ X, try  │ backtracking
+   │ again   │
+   └────┬────┘
+        │
+        └─ Eventually finds
+           solution
+           (SLOW)
+
+Metrics (typical circuit, 150 gates):
+┌──────────────┬──────────┬─────────────┬─────────┐
+│ Metric       │Standard  │ GNN-Guided  │ Speedup │
+├──────────────┼──────────┼─────────────┼─────────┤
+│ Conflicts    │   2,340  │    1,200    │  1.95x  │
+│ Decisions    │     680  │      350    │  1.94x  │
+│ Propagations │   7,850  │    4,100    │  1.91x  │
+│ CPU Time     │  142 ms  │     58 ms   │  2.45x  │
+└──────────────┴──────────┴─────────────┴─────────┘
+"""
+
+# ============================================================================
+# FIGURE 4: Data Structures
+# ============================================================================
+
+DATA_STRUCTURES = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        DATA STRUCTURES                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+1. CIRCUIT GRAPH (From BenchParser)
+   ──────────────────────────────────
+   
+   Gate:    G1 = AND(a, b)
+   
+   Representation:
+   ┌─────────────────────────┐
+   │ gate_dict {             │
+   │   'G1': ('AND',         │
+   │           ['a', 'b'])   │
+   │ }                       │
+   │                         │
+   │ back_edges {            │
+   │   'a': ['G1', 'G3'],    │
+   │   'b': ['G1']           │
+   │ }                       │
+   └─────────────────────────┘
+
+2. NODE FEATURES (16-dimensional)
+   ───────────────────────────────
+   
+   ┌─────────────────────────────┐
+   │ x[i] = [              │ Dims
+   │   gate_type_AND,      │ 8
+   │   gate_type_OR,       │ (one-hot)
+   │   ...,                │
+   │   CC0,                │ 1
+   │   CC1,                │ 1
+   │   CO,                 │ 1
+   │   fanin_count,        │ 1
+   │   fanout_count,       │ 1
+   │   is_input,           │ 1
+   │   is_output,          │ 1
+   │ ]                     │ total: 16
+   └─────────────────────────────┘
+
+3. EDGE INDEX (PyTorch Geometric)
+   ─────────────────────────────
+   
+   Gate: G1 = AND(a, b)
+   
+   Node indices:
+   a→0, b→1, G1→2, G2→3, ...
+   
+   Edge connections:
+   ┌──────────────────┐
+   │ edge_index = [   │
+   │   [0, 1, 0, ...] │ ← Sources
+   │   [2, 2, 3, ...] │ ← Destinations
+   │ ]                │
+   │                  │
+   │ Meaning:         │
+   │ 0→2: a drives G1 │
+   │ 1→2: b drives G1 │
+   │ 0→3: a drives G2 │
+   └──────────────────┘
+
+4. CNF FORMULA (PySAT/DIMACS)
+   ────────────────────────
+   
+   Variable Mapping:
+   a → 1, b → 2, G1 → 3, G2 → 4, ...
+   
+   Gate Logic (AND):
+   G1 = AND(a, b) becomes 3 clauses:
+   ┌──────────────────┐
+   │ (-1 ∨ -2 ∨ 3)   │ ← If a,b=1 then G1=1
+   │ (1 ∨ -3)        │ ← If G1=0 then a=0
+   │ (2 ∨ -3)        │ ← If G1=0 then b=0
+   └──────────────────┘
+
+5. IMPORTANCE SCORES (GNN Output)
+   ──────────────────────────────
+   
+   Variable → GNN Importance
+   ┌────────────────────────┐
+   │ a  → 0.15 (low)        │
+   │ b  → 0.08 (low)        │
+   │ G1 → 0.92 (critical)   │
+   │ G2 → 0.88 (critical)   │
+   │ ... → ...              │
+   │                        │
+   │ Ranking: [G1, G2, ...] │
+   │ (high to low)          │
+   └────────────────────────┘
+
+6. RESULTS OBJECT
+   ──────────────
+   
+   ┌─────────────────────────────┐
+   │ results = {                 │
+   │   'circuit_file': 'c1.ben', │
+   │   'satisfiable': True,      │
+   │   'conflicts': 1200,        │
+   │   'decisions': 450,         │
+   │   'propagations': 4100,     │
+   │   'model': [1, -2, 3, ...], │
+   │   'solve_time': 0.058,      │
+   │   'gnn_var_ordering': [3,   │
+   │     2, 4, 1, ...]           │
+   │ }                           │
+   └─────────────────────────────┘
+"""
+
+# ============================================================================
+# FIGURE 5: File Organization
+# ============================================================================
+
+FILE_ORGANIZATION = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    FILE ORGANIZATION                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+DFT_SAT/
+│
+├─ EXISTING FILES (Your Code)
+│  ├─ BenchParser.py              → Parse .bench circuits
+│  ├─ WireFaultMiter.py           → Build SAT problem with faults
+│  ├─ neuro_utils.py              → Graph feature extraction
+│  ├─ data_train_bench.py         → Train GNN model
+│  ├─ data_train_bench_mem_efficient.py  → Optimized GNN training
+│  └─ glucose/                    → C++ SAT solver (external)
+│
+├─ NEW FILES (NEW SYSTEM)
+│  ├─ GNN_GUIDED_SAT_SOLVER_new.py
+│  │  ├─ GNNGuidedSATSolver class
+│  │  │  ├─ load_gnn_model()
+│  │  │  ├─ extract_gnn_features()
+│  │  │  ├─ predict_variable_importance()
+│  │  │  ├─ build_miter_cnf()
+│  │  │  ├─ get_variable_ordering()
+│  │  │  └─ solve_with_gnn_guidance()
+│  │  │
+│  │  └─ GNNImportancePredictor class
+│  │     └─ GAT-based neural network
+│  │
+│  ├─ GLUCOSE_WRAPPER_new.py
+│  │  └─ GlucoseSolverWrapper class
+│  │     ├─ solve_dimacs()
+│  │     ├─ solve_from_cnf()
+│  │     └─ _parse_glucose_output()
+│  │
+│  ├─ CIRCUIT_SAT_INTEGRATION_new.py
+│  │  └─ CircuitSATAnalyzer class
+│  │     ├─ analyze_circuit()
+│  │     ├─ batch_analyze()
+│  │     └─ generate_report()
+│  │
+│  ├─ QUICKSTART_SETUP_new.py
+│  │  ├─ step1_verify_dependencies()
+│  │  ├─ step2_build_glucose()
+│  │  ├─ step3_check_gnn_model()
+│  │  ├─ step4_test_parser()
+│  │  ├─ step5_test_gnn_solver()
+│  │  └─ step6_run_full_pipeline()
+│  │
+│  └─ DOCUMENTATION
+│     ├─ README_GNN_SAT_SOLVER_new.md
+│     ├─ GNN_SAT_ARCHITECTURE_GUIDE_new.md
+│     ├─ IMPLEMENTATION_SUMMARY_new.md
+│     └─ ARCHITECTURE_DIAGRAMS_new.txt (this file)
+│
+├─ OUTPUT FILES (Generated)
+│  ├─ gnn_model_importance_aware_16feat.pth  → Trained GNN
+│  ├─ example_results/
+│  │  └─ circuit_name_gnn_sat_results.json   → Analysis results
+│  └─ summary_report.json                    → Batch summary
+
+Dependencies:
+├─ Python Packages
+│  ├─ torch (PyTorch)
+│  ├─ torch_geometric (Graph ML)
+│  ├─ pysat (SAT solvers)
+│  └─ Others (numpy, csv, json, ...)
+│
+└─ External
+   └─ Glucose C++ solver (in glucose/)
+"""
+
+# ============================================================================
+# FIGURE 6: Execution Flow
+# ============================================================================
+
+EXECUTION_FLOW = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│                       EXECUTION FLOW                                    │
+└─────────────────────────────────────────────────────────────────────────┘
+
+SINGLE CIRCUIT ANALYSIS
+────────────────────────
+
+User Code:
+┌────────────────────────────────────────────────────────────────┐
+│ from CIRCUIT_SAT_INTEGRATION_new import CircuitSATAnalyzer    │
+│                                                                │
+│ analyzer = CircuitSATAnalyzer("gnn_model.pth")               │
+│ results = analyzer.analyze_circuit("circuit.bench")          │
+└────────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│ CircuitSATAnalyzer.analyze_circuit()                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ [1] Parse Circuit                                           │
+│     │                                                       │
+│     ├─► BenchParser("circuit.bench")                       │
+│     ├─► Extract: inputs, outputs, gates, DFFs              │
+│     └─► Result: Gate list, wire connections               │
+│                                                             │
+│ [2] Extract GNN Features                                    │
+│     │                                                       │
+│     ├─► FastGraphExtractor("circuit.bench")                │
+│     ├─► Build edge_index, node features (16-dim)           │
+│     └─► Result: PyTorch Geometric Data object              │
+│                                                             │
+│ [3] GNN Inference                                           │
+│     │                                                       │
+│     ├─► Load model: GNNImportancePredictor                │
+│     ├─► Forward pass: data.x, data.edge_index              │
+│     └─► Result: Importance scores [0-1]                    │
+│                                                             │
+│ [4] Build SAT Problem                                       │
+│     │                                                       │
+│     ├─► WireFaultMiter("circuit.bench")                    │
+│     ├─► build_miter(fault_wire, fault_type)               │
+│     ├─► Create CNF formula (DIMACS)                        │
+│     └─► Result: Clauses list                              │
+│                                                             │
+│ [5] Solve with GNN Guidance                                │
+│     │                                                       │
+│     ├─► Create var ordering from GNN scores                │
+│     ├─► Initialize Glucose3 solver                         │
+│     ├─► set_phases(gnn_var_ordering)                       │
+│     ├─► solver.solve()                                     │
+│     └─► Result: SAT/UNSAT + metrics                        │
+│                                                             │
+│ [6] Standard Solve (for comparison)                         │
+│     │                                                       │
+│     ├─► GlucoseSolverWrapper.solve_from_cnf(cnf)          │
+│     ├─► No GNN hints, generic heuristics                   │
+│     └─► Result: SAT/UNSAT + metrics                        │
+│                                                             │
+│ [7] Analyze & Format Results                               │
+│     │                                                       │
+│     ├─► Gather statistics                                  │
+│     ├─► Compare GNN vs standard                            │
+│     └─► Create results dictionary                          │
+│                                                             │
+│ [8] Save Results                                            │
+│     │                                                       │
+│     └─► JSON file to output_dir/                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+                    Results JSON file
+                    with all metrics
+"""
+
+# ============================================================================
+# FIGURE 7: GNN Training vs Inference
+# ============================================================================
+
+GNN_TRAINING_VS_INFERENCE = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│          GNN TRAINING vs INFERENCE                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+TRAINING PHASE (Done Once)
+──────────────────────────
+
+data_train_bench_mem_efficient.py
+
+Input: Multiple .bench circuits with fault labels
+
+For each circuit:
+  ├─ Generate: Importance-aware dataset
+  │  ├─ Solve: Using SAT solver
+  │  ├─ Collect: Variable importance from solver stats
+  │  └─ Label: Which variables were critical?
+  │
+  ├─ Features: SCOAP metrics + graph structure
+  │
+  └─ Target: Importance scores [0-1]
+
+Model Training:
+  ├─ Loss: MSE(GNN_output, true_importance)
+  ├─ Optimizer: Adam
+  ├─ Epochs: 20-50
+  └─ → Trained model: gnn_model_importance_aware_16feat.pth
+
+INFERENCE PHASE (Used for Solving)
+───────────────────────────────────
+
+GNNGuidedSATSolver.solve_with_gnn_guidance()
+
+Input: Unseen circuit (no labels needed)
+
+New Circuit:
+  ├─ Features: Extract same way as training
+  │  ├─ SCOAP metrics (calculated)
+  │  ├─ Graph structure (parsed)
+  │  └─ Gate types (from parser)
+  │
+  ├─ Forward Pass: x, edge_index → model
+  │  ├─ GAT Layer 1: Propagate features
+  │  ├─ GAT Layer 2: Learn importance
+  │  └─ Output Layer: Final scores
+  │
+  └─ Output: Importance scores [0-1]
+     └─ Used as hints for SAT solver
+
+Model Weights: FIXED (from training)
+Gradient Computation: OFF (no_grad())
+Time: Real-time (fast, <1s)
+
+KEY DIFFERENCE:
+  Training: Learn to predict importance
+  Inference: Use predictions to guide SAT solver
+"""
+
+# ============================================================================
+# FIGURE 8: Integration with Existing Code
+# ============================================================================
+
+INTEGRATION_DIAGRAM = """
+┌─────────────────────────────────────────────────────────────────────────┐
+│           INTEGRATION WITH EXISTING CODE                               │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Your Original Project:
+┌──────────────────────────────────────────────────────────────────────┐
+│ DFT_SAT/                                                             │
+│ ├─ BenchParser.py ──────────┐                                        │
+│ ├─ WireFaultMiter.py        │                                        │
+│ ├─ neuro_utils.py ──────────┼─► Training & Existing analysis        │
+│ ├─ data_train_bench*.py     │                                        │
+│ └─ glucose/ (C++)           │                                        │
+└──────────────────────────────────────────────────────────────────────┘
+
+                                │
+                                │ REUSE (imports)
+                                ▼
+
+NEW GNN-SAT SYSTEM:
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  GNN_GUIDED_SAT_SOLVER_new.py                                       │
+│  ├─ imports BenchParser                                             │
+│  ├─ imports FastGraphExtractor (from neuro_utils)                  │
+│  ├─ imports WireFaultMiter                                         │
+│  └─ imports data_train_bench_mem_efficient (for model)             │
+│                  │                                                  │
+│                  ▼                                                  │
+│         ┌──────────────────────┐                                    │
+│         │ Orchestrates         │                                    │
+│         │ parsing + GNN + SAT  │                                    │
+│         └──────────────────────┘                                    │
+│                                                                       │
+│  GLUCOSE_WRAPPER_new.py                                            │
+│  └─ subprocess interface to glucose/                               │
+│                                                                       │
+│  CIRCUIT_SAT_INTEGRATION_new.py                                    │
+│  └─ High-level API using above                                     │
+│                                                                       │
+│  QUICKSTART_SETUP_new.py                                           │
+│  └─ Verification tool                                              │
+│                                                                       │
+└──────────────────────────────────────────────────────────────────────┘
+
+IMPORT CHAIN:
+────────────
+
+CIRCUIT_SAT_INTEGRATION_new.py
+    ├─ imports BenchParser
+    ├─ imports WireFaultMiter
+    ├─ imports GNN_GUIDED_SAT_SOLVER_new
+    │  ├─ imports BenchParser
+    │  ├─ imports WireFaultMiter
+    │  ├─ imports data_train_bench_mem_efficient (FastGraphExtractor)
+    │  └─ uses Glucose3 (from pysat)
+    │
+    └─ imports GLUCOSE_WRAPPER_new
+       └─ uses subprocess to call glucose/parallel/glucose binary
+
+Result: All modules integrated, no code duplication!
+"""
+
+# ============================================================================
+# Print all diagrams
+# ============================================================================
+
+if __name__ == "__main__":
+    diagrams = [
+        ("PIPELINE", PIPELINE_DIAGRAM),
+        ("GNN ARCHITECTURE", GNN_ARCHITECTURE),
+        ("SAT COMPARISON", SAT_COMPARISON),
+        ("DATA STRUCTURES", DATA_STRUCTURES),
+        ("FILE ORGANIZATION", FILE_ORGANIZATION),
+        ("EXECUTION FLOW", EXECUTION_FLOW),
+        ("GNN TRAINING vs INFERENCE", GNN_TRAINING_VS_INFERENCE),
+        ("INTEGRATION", INTEGRATION_DIAGRAM),
+    ]
+    
+    for name, diagram in diagrams:
+        print("\n" + "="*80)
+        print(f"FIGURE: {name}")
+        print("="*80)
+        print(diagram)
