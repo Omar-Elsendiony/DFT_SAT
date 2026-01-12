@@ -190,20 +190,40 @@ class GlucoseSolverWrapper:
         elif return_code == 20:
             results['satisfiable'] = False
         
-        # Parse statistics
-        patterns = {
+        # Parse statistics - handle both single-threaded and multi-threaded format
+        
+        # Try single-threaded format first (lowercase with colons)
+        single_patterns = {
             'conflicts': r'conflicts\s*:\s*(\d+)',
             'decisions': r'decisions\s*:\s*(\d+)',
             'propagations': r'propagations\s*:\s*(\d+)',
             'variables': r'variables\s*:\s*(\d+)',
             'clauses': r'clauses\s*:\s*(\d+)',
-            'cpu_time': r'CPU time\s*:\s*([\d.]+)'
+            'cpu_time': r'cpu time\s*:\s*([\d.]+)'
         }
         
-        for key, pattern in patterns.items():
+        for key, pattern in single_patterns.items():
             match = re.search(pattern, output, re.IGNORECASE)
             if match:
                 results[key] = float(match.group(1))
+        
+        # Try multi-threaded format (table format with | separators)
+        # Extract "Total" column from the table
+        if results['conflicts'] is None or results['conflicts'] == 0:
+            # Look for "| Conflicts     |      926 |" pattern
+            conflicts_match = re.search(r'\|\s*Conflicts\s+\|\s+(\d+)', output)
+            if conflicts_match:
+                results['conflicts'] = float(conflicts_match.group(1))
+        
+        if results['decisions'] is None or results['decisions'] == 0:
+            decisions_match = re.search(r'\|\s*Decisions\s+\|\s+(\d+)', output)
+            if decisions_match:
+                results['decisions'] = float(decisions_match.group(1))
+        
+        if results['propagations'] is None or results['propagations'] == 0:
+            propagations_match = re.search(r'\|\s*Propagations\s+\|\s+(\d+)', output)
+            if propagations_match:
+                results['propagations'] = float(propagations_match.group(1))
         
         # Extract satisfying assignment if SAT
         if results['satisfiable']:
