@@ -45,11 +45,19 @@ class GlucoseSolverWrapper:
     def _find_or_build_glucose(self):
         """Find Glucose binary or build if not present."""
         
-        # Check parallel solver first
+        # Check for different possible binary names and locations
+        # Priority: parallel version (glucose-syrup) > sequential versions
         candidates = [
+            # Parallel version (built from glucose/parallel)
+            os.path.join(self.glucose_dir, "glucose-syrup"),
+            os.path.join(self.glucose_dir, "glucose"),
+            os.path.join(self.glucose_dir, "parallel", "glucose-syrup"),
             os.path.join(self.glucose_dir, "parallel", "glucose"),
+            # Sequential versions
             os.path.join(self.glucose_dir, "simp", "glucose"),
+            os.path.join(self.glucose_dir, "simp", "glucose_static"),
             os.path.join(self.glucose_dir, "core", "glucose"),
+            os.path.join(self.glucose_dir, "core", "glucose_static"),
         ]
         
         for candidate in candidates:
@@ -58,11 +66,19 @@ class GlucoseSolverWrapper:
                 print(f"✓ Found Glucose binary: {candidate}")
                 return
         
-        # If not found, offer to build
+        # If not found, provide helpful error message
         print(f"⚠ Glucose binary not found in {self.glucose_dir}")
-        print(f"  Run: cd {self.glucose_dir}/parallel && make")
+        
+        # Check if source exists to provide build instructions
+        parallel_dir = os.path.join(self.glucose_dir, "parallel")
+        if os.path.exists(parallel_dir):
+            print(f"  Run: cd {parallel_dir} && make")
+        else:
+            print(f"  Glucose source not found in {self.glucose_dir}")
+        
         raise FileNotFoundError(
-            f"Glucose solver not found. Please build it first."
+            f"Glucose solver not found. Please build it first.\n"
+            f"Expected locations checked: {candidates}"
         )
     
     def solve_dimacs(self, dimacs_file: str, timeout: int = 300, 
@@ -83,6 +99,7 @@ class GlucoseSolverWrapper:
         
         print(f"\n{'='*70}")
         print(f"Glucose C++ SAT Solver")
+        print(f"Binary: {os.path.basename(self.glucose_binary)}")
         print(f"Input: {os.path.basename(dimacs_file)}")
         print(f"Timeout: {timeout}s")
         print(f"{'='*70}\n")
