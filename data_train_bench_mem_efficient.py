@@ -5,6 +5,11 @@ This is the COMPLETE SECOND SCRIPT with 16 features (including CO and is_output)
 
 import os
 import sys
+
+# Add cloned PySAT to path BEFORE other imports
+# This ensures we use the local clone, not pip-installed version
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pysat'))
+
 import time
 import csv
 import math
@@ -25,13 +30,13 @@ from torch_geometric.data import Data
 # =============================================================================
 # CONFIGS
 # =============================================================================
-BENCH_DIR = "../synthetic_bench"
+BENCH_DIR = "../hdl-benchmarks/iscas85/bench/"
 DATASET_PATH = "dataset_oracle_importance_16feat.pt"
 SAMPLES_PER_FILE = 50
 MODEL_PATH = "gnn_model_importance_aware_16feat.pth"
 EPOCHS = 20
 BATCH_SIZE = 32
-BENCHMARK_DIR = "../hdl-benchmarks/iscas89/bench/"
+BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
 
 # =============================================================================
 # PART 0: ENHANCED FAST GRAPH EXTRACTOR WITH OBSERVABILITY (16 FEATURES)
@@ -346,6 +351,7 @@ def generate_importance_aware_dataset():
                     base_conflicts = solver.accum_stats()['conflicts']
                     
                     input_importance = {}
+                    input_polarity = {}  # Track which polarity reduces conflicts
                     
                     for input_name in miter.inputs:
                         var_id = miter.var_map[input_name]
@@ -365,6 +371,14 @@ def generate_importance_aware_dataset():
                                 importance = 10000
                         
                         input_importance[input_name] = importance
+                        
+                        # Store polarity: if wrong_val causes MORE conflicts, then correct_val is better
+                        # Value 1 = prefer this variable TRUE, -1 = prefer this variable FALSE
+                        if importance > 0:  # Variable is important
+                            # The polarity that causes MORE conflicts when negated is the one to prefer
+                            input_polarity[input_name] = 1 if var_id in model else -1
+                        else:
+                            input_polarity[input_name] = 0  # No strong preference
                     
                     max_importance = max(input_importance.values()) if input_importance else 1
                     normalized_importance = {
@@ -381,7 +395,8 @@ def generate_importance_aware_dataset():
                     for i, node_name in enumerate(data.node_names):
                         if node_name in input_set:
                             var_id = miter.var_map[node_name]
-                            y_solution[i] = 1.0 if var_id in model else 0.0
+                            # Use polarity that reduces conflicts, not solution polarity
+                            y_solution[i] = (input_polarity[node_name] + 1.0) / 2.0  # Convert -1,0,1 to 0,0.5,1
                             y_importance[i] = normalized_importance.get(node_name, 0.0)
                             train_mask[i] = 1.0
                     
@@ -408,7 +423,7 @@ def generate_importance_aware_dataset():
 
 class CircuitGNN_ImportanceAware(torch.nn.Module):
     """
-    GNN with two prediction heads for 16-feature inputs
+    GNN for predicting variable importance in SAT solving
     """
     
     def __init__(self, num_node_features=16, num_layers=8, hidden_dim=64, dropout=0.2):
@@ -430,7 +445,7 @@ class CircuitGNN_ImportanceAware(torch.nn.Module):
         self.convs.append(GATv2Conv(hidden_dim, 32, heads=2, concat=False))
         self.bns.append(torch.nn.BatchNorm1d(32))
         
-        self.value_head = torch.nn.Linear(32, 1)
+        # Only importance head - that's what works
         self.importance_head = torch.nn.Linear(32, 1)
     
     def forward(self, data):
@@ -451,10 +466,9 @@ class CircuitGNN_ImportanceAware(torch.nn.Module):
         x = self.bns[-1](x)
         x = torch.nn.functional.elu(x)
         
-        value_logits = self.value_head(x)
         importance_scores = self.importance_head(x)
         
-        return value_logits, importance_scores
+        return importance_scores
 
 
 # =============================================================================
@@ -489,44 +503,47 @@ def train_importance_aware_model():
     ).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    value_criterion = nn.BCEWithLogitsLoss(reduction='none')
     importance_criterion = nn.MSELoss(reduction='none')
     
     for epoch in range(EPOCHS):
         model.train()
-        total_value_loss = 0
         total_importance_loss = 0
-        total_combined_loss = 0
         
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
             
-            value_logits, importance_preds = model(batch)
-            
-            value_loss_raw = value_criterion(value_logits, batch.y)
-            value_loss_masked = (value_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
+            importance_preds = model(batch)
             
             importance_loss_raw = importance_criterion(importance_preds, batch.y_importance)
             importance_loss_masked = (importance_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
             
-            combined_loss = 0.6 * value_loss_masked + 0.4 * importance_loss_masked
-            
-            combined_loss.backward()
+            importance_loss_masked.backward()
             optimizer.step()
             
-            total_value_loss += value_loss_masked.item()
             total_importance_loss += importance_loss_masked.item()
-            total_combined_loss += combined_loss.item()
         
-        avg_value = total_value_loss / len(train_loader)
         avg_importance = total_importance_loss / len(train_loader)
-        avg_combined = total_combined_loss / len(train_loader)
+        
+        # Validation
+        model.eval()
+        val_importance_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(device)
+                importance_preds = model(batch)
+                
+                importance_loss_raw = importance_criterion(importance_preds, batch.y_importance)
+                importance_loss_masked = (importance_loss_raw * batch.train_mask).sum() / batch.train_mask.sum().clamp(min=1)
+                
+                val_importance_loss += importance_loss_masked.item()
+        
+        avg_val_importance = val_importance_loss / len(val_loader)
         
         print(f"Epoch {epoch+1}/{EPOCHS}:")
-        print(f"  Value Loss: {avg_value:.5f}")
-        print(f"  Importance Loss: {avg_importance:.5f}")
-        print(f"  Combined Loss: {avg_combined:.5f}")
+        print(f"  Train - Importance: {avg_importance:.5f}")
+        print(f"  Val   - Importance: {avg_val_importance:.5f}")
+        print(f"  Sample predictions - Importance range: [{importance_preds.min():.3f}, {importance_preds.max():.3f}]")
     
     torch.save(model.state_dict(), MODEL_PATH)
     print(f"\n--- Training Complete. Model saved to {MODEL_PATH} ---")
@@ -574,7 +591,7 @@ def run_importance_guided_benchmark():
                 cnf.extend(clauses)
                 
                 t_std = time.time()
-                with Glucose3(bootstrap_with=cnf) as solver:
+                with Glucose3(bootstrap_with=cnf, incr=True) as solver:
                     solver.solve()
                     std_conflicts = solver.accum_stats()['conflicts']
                 std_time = time.time() - t_std
@@ -586,32 +603,30 @@ def run_importance_guided_benchmark():
                 data = data.to(device)
                 
                 with torch.no_grad():
-                    value_logits, importance_scores = model(data)
-                    value_probs = torch.sigmoid(value_logits)
+                    importance_scores = model(data)
                 
-                hints = []
+                # Get TOP_K most important input variables
+                input_importance_list = []
                 for idx, name in enumerate(data.node_names):
                     if name in input_names:
-                        prob = value_probs[idx].item()
-                        value = 1 if prob > 0.5 else -1
                         importance = importance_scores[idx].item()
-                        
                         var_id = miter.var_map.get(name)
                         if var_id:
-                            hints.append((var_id, value, importance))
+                            input_importance_list.append((var_id, importance))
                 
-                hints.sort(key=lambda x: x[2], reverse=True)
-                
+                # Sort by importance and get top K
+                input_importance_list.sort(key=lambda x: x[1], reverse=True)
                 TOP_K = 5
-                top_assumptions = [h[0] * h[1] for h in hints[:TOP_K]]
+                top_k_vars = [h[0] for h in input_importance_list[:TOP_K]]
                 
-                gnn_conflicts = 0
-                with Glucose3(bootstrap_with=cnf) as solver:
-                    if solver.solve(assumptions=top_assumptions):
-                        gnn_conflicts = solver.accum_stats()['conflicts']
-                    else:
-                        solver.solve()
-                        gnn_conflicts = solver.accum_stats()['conflicts'] + 1000
+                print(f"   Top {TOP_K} important variables: {top_k_vars}")
+                print(f"   Importance scores: {[f'{h[1]:.4f}' for h in input_importance_list[:TOP_K]]}")
+                
+                # Soft phase hints only - allows full backtracking
+                with Glucose3(bootstrap_with=cnf, incr=True) as solver:
+                    solver.set_phases(top_k_vars)  # Soft preference only
+                    result = solver.solve()         # Solver can backtrack freely
+                    gnn_conflicts = solver.accum_stats()['conflicts']
                 
                 gnn_time = time.time() - t_gnn
                 
