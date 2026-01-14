@@ -8,6 +8,8 @@ This script demonstrates the full workflow:
 4. Use GNN to guide variable ordering
 5. Solve with Glucose SAT solver
 6. Analyze and report results
+
+FIXED: Added device parameter support and proper wrapper usage
 """
 
 import os
@@ -23,7 +25,13 @@ from pysat.formula import CNF
 from BenchParser import BenchParser
 from WireFaultMiter import WireFaultMiter
 from GNN_GUIDED_SAT_SOLVER_new import GNNGuidedSATSolver
-from GLUCOSE_WRAPPER_new import GlucoseSolverWrapper
+
+# Try to import wrapper
+try:
+    from GLUCOSE_WRAPPER_new import GlucoseSolverWrapper
+    WRAPPER_AVAILABLE = True
+except ImportError:
+    WRAPPER_AVAILABLE = False
 
 
 class CircuitSATAnalyzer:
@@ -33,18 +41,24 @@ class CircuitSATAnalyzer:
     
     def __init__(self, gnn_model_path: Optional[str] = None, 
                  glucose_dir: Optional[str] = None,
-                 device: str = "cpu"):
+                 device: str = None):
         """
         Initialize the analyzer.
         
         Args:
             gnn_model_path: Path to trained GNN model
             glucose_dir: Path to glucose solver directory
-            device: 'cpu' or 'cuda'
+            device: 'cpu', 'cuda', or None (auto-detect)
         """
+        # Auto-detect device if not specified
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
         self.device = device
         self.gnn_solver = None
         self.glucose_wrapper = None
+        
+        print(f"✓ Using device: {self.device}")
         
         # Load GNN if path provided
         if gnn_model_path and os.path.exists(gnn_model_path):
@@ -55,10 +69,14 @@ class CircuitSATAnalyzer:
             print("  Falling back to standard SAT solving without GNN guidance.")
         
         # Initialize Glucose wrapper
-        try:
-            self.glucose_wrapper = GlucoseSolverWrapper(glucose_dir)
-        except FileNotFoundError:
-            print("⚠ Glucose solver not found. Will use PySAT solver only.")
+        if WRAPPER_AVAILABLE:
+            try:
+                self.glucose_wrapper = GlucoseSolverWrapper(glucose_dir)
+                print("✓ GlucoseSolverWrapper initialized")
+            except Exception as e:
+                print(f"⚠ Glucose wrapper init failed: {e}")
+        else:
+            print("⚠ GlucoseSolverWrapper not available")
     
     def analyze_circuit(self, bench_file: str, 
                        fault_wire: Optional[str] = None,
@@ -145,7 +163,7 @@ class CircuitSATAnalyzer:
                 print(f"  ✗ GNN solving failed: {e}")
                 results['solving_results']['gnn_guided'] = {'error': str(e)}
         
-        # Standard Glucose Solving
+        # Standard Glucose Solving (if wrapper available)
         if self.glucose_wrapper:
             print("\n[Step 5] Standard Glucose Solving...")
             try:
@@ -156,9 +174,9 @@ class CircuitSATAnalyzer:
                 )
                 results['solving_results']['glucose_standard'] = glucose_results
                 print(f"  ✓ Glucose Solve: {glucose_results['satisfiable']}")
-                if glucose_results['conflicts']:
+                if glucose_results.get('conflicts'):
                     print(f"    - Conflicts: {glucose_results['conflicts']}")
-                if glucose_results['decisions']:
+                if glucose_results.get('decisions'):
                     print(f"    - Decisions: {glucose_results['decisions']}")
             except Exception as e:
                 print(f"  ✗ Glucose solving failed: {e}")
@@ -184,7 +202,7 @@ class CircuitSATAnalyzer:
         Returns:
             List of results dictionaries
         """
-        bench_files = [f for f in Path(bench_dir).glob("*.bench")]
+        bench_files = list(Path(bench_dir).glob("*.bench"))
         
         if max_circuits:
             bench_files = bench_files[:max_circuits]
@@ -284,6 +302,8 @@ def main():
     parser.add_argument('circuit', help='Path to .bench circuit file or directory')
     parser.add_argument('--gnn-model', help='Path to trained GNN model')
     parser.add_argument('--glucose-dir', help='Path to glucose directory')
+    parser.add_argument('--device', choices=['cpu', 'cuda', 'auto'], default='auto',
+                       help='Device to use: cpu, cuda, or auto (default: auto)')
     parser.add_argument('--fault-wire', help='Wire to inject fault')
     parser.add_argument('--fault-type', type=int, default=0, help='Fault type: 0 or 1')
     parser.add_argument('--output-dir', help='Directory to save results')
@@ -293,10 +313,14 @@ def main():
     
     args = parser.parse_args()
     
+    # Handle device argument
+    device = None if args.device == 'auto' else args.device
+    
     # Initialize analyzer
     analyzer = CircuitSATAnalyzer(
         gnn_model_path=args.gnn_model,
-        glucose_dir=args.glucose_dir
+        glucose_dir=args.glucose_dir,
+        device=device
     )
     
     # Single circuit or batch analysis

@@ -1,6 +1,7 @@
 """
 Complete pipeline for importance-aware GNN training with SCOAP Observability
 This is the COMPLETE SECOND SCRIPT with 16 features (including CO and is_output)
+NOW WITH OPTIONAL GlucoseSolverWrapper SUPPORT
 """
 
 import os
@@ -21,6 +22,14 @@ from torch_geometric.data import Dataset
 from WireFaultMiter import WireFaultMiter
 from BenchParser import BenchParser
 from torch_geometric.data import Data
+
+# Try to import GlucoseSolverWrapper (optional)
+try:
+    from GLUCOSE_WRAPPER_new import GlucoseSolverWrapper
+    WRAPPER_AVAILABLE = True
+except ImportError:
+    WRAPPER_AVAILABLE = False
+    print("⚠ GlucoseSolverWrapper not available, using direct Glucose3")
 
 # =============================================================================
 # CONFIGS
@@ -294,7 +303,7 @@ class FastGraphExtractor:
 
 
 # =============================================================================
-# PART 1: DATA GENERATION WITH IMPORTANCE
+# PART 1: DATA GENERATION WITH IMPORTANCE (WITH OPTIONAL WRAPPER SUPPORT)
 # =============================================================================
 
 def get_target_files():
@@ -307,9 +316,20 @@ def generate_importance_aware_dataset():
     """
     Generate dataset with importance labels
     Uses 16-feature extractor with observability
+    NOW WITH OPTIONAL GlucoseSolverWrapper SUPPORT
     """
     print(f"--- MINING IMPORTANCE-AWARE ORACLE DATA (16 Features) ---")
     dataset = []
+    
+    # Initialize wrapper if available
+    glucose_wrapper = None
+    if WRAPPER_AVAILABLE:
+        try:
+            glucose_wrapper = GlucoseSolverWrapper()
+            print("✓ Using GlucoseSolverWrapper")
+        except Exception as e:
+            print(f"⚠ GlucoseSolverWrapper init failed: {e}")
+            print("  Falling back to direct Glucose3")
     
     if not os.path.exists(BENCH_DIR):
         print(f"Error: {BENCH_DIR} not found.")
@@ -335,62 +355,83 @@ def generate_importance_aware_dataset():
                 cnf = CNF()
                 cnf.extend(clauses)
                 
-                with Glucose3(bootstrap_with=cnf) as solver:
-                    if not solver.solve():
+                # Use wrapper if available, otherwise direct Glucose3
+                if glucose_wrapper:
+                    result = glucose_wrapper.solve_from_cnf(cnf, timeout=30, verbose=False)
+                    if not result['satisfiable']:
                         continue
-                    
-                    model = solver.get_model()
+                    model = result.get('model', [])
                     if not model:
                         continue
+                    base_conflicts = result.get('conflicts', 0)
+                else:
+                    with Glucose3(bootstrap_with=cnf) as solver:
+                        if not solver.solve():
+                            continue
+                        model = solver.get_model()
+                        if not model:
+                            continue
+                        base_conflicts = solver.accum_stats()['conflicts']
+                
+                input_importance = {}
+                
+                for input_name in miter.inputs:
+                    var_id = miter.var_map[input_name]
+                    correct_val = var_id if var_id in model else -var_id
+                    wrong_val = -correct_val
                     
-                    base_conflicts = solver.accum_stats()['conflicts']
+                    test_cnf = CNF()
+                    test_cnf.extend(clauses)
                     
-                    input_importance = {}
-                    
-                    for input_name in miter.inputs:
-                        var_id = miter.var_map[input_name]
-                        correct_val = var_id if var_id in model else -var_id
-                        wrong_val = -correct_val
-                        
-                        test_cnf = CNF()
-                        test_cnf.extend(clauses)
-                        
+                    # Use wrapper or direct call
+                    if glucose_wrapper:
+                        result = glucose_wrapper.solve_from_cnf(
+                            test_cnf,
+                            assumptions=[wrong_val],
+                            timeout=30,
+                            verbose=False
+                        )
+                        if result['satisfiable']:
+                            wrong_conflicts = result.get('conflicts', 0)
+                            importance = abs(wrong_conflicts - base_conflicts)
+                        else:
+                            importance = 10000
+                    else:
                         with Glucose3(bootstrap_with=test_cnf) as test_solver:
                             result = test_solver.solve(assumptions=[wrong_val])
-                            
                             if result:
                                 wrong_conflicts = test_solver.accum_stats()['conflicts']
                                 importance = abs(wrong_conflicts - base_conflicts)
                             else:
                                 importance = 10000
-                        
-                        input_importance[input_name] = importance
                     
-                    max_importance = max(input_importance.values()) if input_importance else 1
-                    normalized_importance = {
-                        k: v / max(max_importance, 1.0) 
-                        for k, v in input_importance.items()
-                    }
-                    
-                    data = extractor.get_data_for_fault(target_gate)
-                    
-                    y_solution = torch.zeros(len(data.node_names), 1)
-                    y_importance = torch.zeros(len(data.node_names), 1)
-                    train_mask = torch.zeros(len(data.node_names), 1)
-                    
-                    for i, node_name in enumerate(data.node_names):
-                        if node_name in input_set:
-                            var_id = miter.var_map[node_name]
-                            y_solution[i] = 1.0 if var_id in model else 0.0
-                            y_importance[i] = normalized_importance.get(node_name, 0.0)
-                            train_mask[i] = 1.0
-                    
-                    data.y = y_solution
-                    data.y_importance = y_importance
-                    data.train_mask = train_mask
-                    data.base_conflicts = base_conflicts
-                    
-                    dataset.append(data)
+                    input_importance[input_name] = importance
+                
+                max_importance = max(input_importance.values()) if input_importance else 1
+                normalized_importance = {
+                    k: v / max(max_importance, 1.0) 
+                    for k, v in input_importance.items()
+                }
+                
+                data = extractor.get_data_for_fault(target_gate)
+                
+                y_solution = torch.zeros(len(data.node_names), 1)
+                y_importance = torch.zeros(len(data.node_names), 1)
+                train_mask = torch.zeros(len(data.node_names), 1)
+                
+                for i, node_name in enumerate(data.node_names):
+                    if node_name in input_set:
+                        var_id = miter.var_map[node_name]
+                        y_solution[i] = 1.0 if var_id in model else 0.0
+                        y_importance[i] = normalized_importance.get(node_name, 0.0)
+                        train_mask[i] = 1.0
+                
+                data.y = y_solution
+                data.y_importance = y_importance
+                data.train_mask = train_mask
+                data.base_conflicts = base_conflicts
+                
+                dataset.append(data)
         
         except Exception as e:
             print(f"Error processing {filename}: {e}")
@@ -533,14 +574,24 @@ def train_importance_aware_model():
 
 
 # =============================================================================
-# PART 4: BENCHMARKING
+# PART 4: BENCHMARKING (WITH OPTIONAL WRAPPER SUPPORT)
 # =============================================================================
 
 def run_importance_guided_benchmark():
-    """Benchmark with importance-guided SAT solving"""
+    """Benchmark with importance-guided SAT solving - WITH WRAPPER SUPPORT"""
     print(f"--- BENCHMARKING WITH IMPORTANCE-GUIDED HINTS (16 Features) ---")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Initialize wrapper if available
+    glucose_wrapper = None
+    if WRAPPER_AVAILABLE:
+        try:
+            glucose_wrapper = GlucoseSolverWrapper()
+            print("✓ Using GlucoseSolverWrapper for benchmarking")
+        except Exception as e:
+            print(f"⚠ GlucoseSolverWrapper init failed: {e}")
+            print("  Falling back to direct Glucose3")
     
     model = CircuitGNN_ImportanceAware(num_node_features=16, num_layers=8).to(device)
     if not os.path.exists(MODEL_PATH):
@@ -573,12 +624,18 @@ def run_importance_guided_benchmark():
                 cnf = CNF()
                 cnf.extend(clauses)
                 
+                # STANDARD SOLVING
                 t_std = time.time()
-                with Glucose3(bootstrap_with=cnf) as solver:
-                    solver.solve()
-                    std_conflicts = solver.accum_stats()['conflicts']
+                if glucose_wrapper:
+                    std_result = glucose_wrapper.solve_from_cnf(cnf, timeout=60, verbose=False)
+                    std_conflicts = std_result.get('conflicts', 0)
+                else:
+                    with Glucose3(bootstrap_with=cnf) as solver:
+                        solver.solve()
+                        std_conflicts = solver.accum_stats()['conflicts']
                 std_time = time.time() - t_std
                 
+                # GNN-GUIDED SOLVING
                 t_gnn = time.time()
                 data = extractor.get_data_for_fault(target_gate)
                 if data is None:
@@ -605,13 +662,28 @@ def run_importance_guided_benchmark():
                 TOP_K = 5
                 top_assumptions = [h[0] * h[1] for h in hints[:TOP_K]]
                 
-                gnn_conflicts = 0
-                with Glucose3(bootstrap_with=cnf) as solver:
-                    if solver.solve(assumptions=top_assumptions):
-                        gnn_conflicts = solver.accum_stats()['conflicts']
+                # Solve with GNN hints
+                if glucose_wrapper:
+                    gnn_result = glucose_wrapper.solve_from_cnf(
+                        cnf,
+                        assumptions=top_assumptions,
+                        timeout=60,
+                        verbose=False
+                    )
+                    if gnn_result['satisfiable']:
+                        gnn_conflicts = gnn_result.get('conflicts', 0)
                     else:
-                        solver.solve()
-                        gnn_conflicts = solver.accum_stats()['conflicts'] + 1000
+                        # Retry without assumptions
+                        retry_result = glucose_wrapper.solve_from_cnf(cnf, timeout=60, verbose=False)
+                        gnn_conflicts = retry_result.get('conflicts', 0) + 1000
+                else:
+                    gnn_conflicts = 0
+                    with Glucose3(bootstrap_with=cnf) as solver:
+                        if solver.solve(assumptions=top_assumptions):
+                            gnn_conflicts = solver.accum_stats()['conflicts']
+                        else:
+                            solver.solve()
+                            gnn_conflicts = solver.accum_stats()['conflicts'] + 1000
                 
                 gnn_time = time.time() - t_gnn
                 
@@ -649,10 +721,11 @@ def run_importance_guided_benchmark():
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python importance_pipeline_16feat.py generate  # Generate dataset")
-        print("  python importance_pipeline_16feat.py train     # Train model")
-        print("  python importance_pipeline_16feat.py benchmark # Run benchmark")
+        print("  python data_train_bench_mem_efficient.py generate  # Generate dataset")
+        print("  python data_train_bench_mem_efficient.py train     # Train model")
+        print("  python data_train_bench_mem_efficient.py benchmark # Run benchmark")
         print("\nFeatures: 16-dimensional with SCOAP observability")
+        print("Optional: GlucoseSolverWrapper support (auto-detected)")
     else:
         command = sys.argv[1]
         
