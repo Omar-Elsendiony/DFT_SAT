@@ -13,14 +13,13 @@ class WireFaultMiter:
         self.outputs = self.parser.all_outputs    # POs + PPOs
         self.gates = self.parser.gates
         
-        # Build variable map
+        # Build variable map (Deterministic from Parser)
         self.var_map = self.parser.build_var_map()
         self.next_var = len(self.var_map) + 1
         
-        # Faulty circuit mapping (will be populated during miter build)
+        # Faulty circuit mapping
         self.faulty_map = {}
         
-        # Track Scan Chains for debug/miter construction
         self.scan_inputs = self.parser.ppis
         self.scan_outputs = self.parser.ppos
 
@@ -34,12 +33,17 @@ class WireFaultMiter:
         clauses = []
         
         # --- 1. Good Circuit ---
+        # self.gates is a list (Deterministic order from file)
         for out, g_type, inputs in self.gates:
             self._add_gate_clauses(clauses, self.var_map[out], g_type, [self.var_map[i] for i in inputs])
             
         # --- 2. Faulty Circuit ---
         # Map inputs to same vars, but internal wires get new vars
-        self.faulty_map = {name: self.var_map[name] for name in self.inputs}
+        # Dict insertion order is preserved in Python 3.7+, but iterating input list is safer
+        self.faulty_map = {}
+        for name in self.inputs:
+            self.faulty_map[name] = self.var_map[name]
+            
         for out, _, _ in self.gates:
             if out not in self.faulty_map:
                 self.faulty_map[out] = self.next_var
@@ -52,23 +56,23 @@ class WireFaultMiter:
             elif fault_type == 0: clauses.append([-fault_gate_var]) # Stuck-at-0
 
         for out, g_type, inputs in self.gates:
-            # --- CRITICAL FIX: Disconnect Logic for Faulty Wire ---
-            # If this gate drives the wire that is currently stuck, 
-            # we must NOT generate clauses for it. The wire is controlled by the fault, not the gate.
+            # If gate drives the fault wire, disconnect it (fault overrides)
             if out == fault_wire:
                 continue
-            # -----------------------------------------------------
 
             out_var = self.faulty_map[out]
             in_vars = [self.faulty_map.get(i) for i in inputs]
-            if None in in_vars: continue # Skip if inputs are missing (rare scan edge case)
+            if None in in_vars: continue 
             self._add_gate_clauses(clauses, out_var, g_type, in_vars)
 
         # --- 3. Miter Comparator (XOR Outputs) ---
         miter_out = self.next_var; self.next_var += 1
         diff_vars = []
         
-        unique_outputs = list(set(self.outputs)) # Handles POs and PPOs
+        # --- FIX FOR DETERMINISM ---
+        # Old: unique_outputs = list(set(self.outputs)) -> Random order!
+        # New: Sorted list -> Fixed order
+        unique_outputs = sorted(list(set(self.outputs)))
         
         for out in unique_outputs:
             if out not in self.var_map or out not in self.faulty_map: continue
@@ -77,7 +81,8 @@ class WireFaultMiter:
             bad = self.faulty_map[out]
             diff = self.next_var; self.next_var += 1
             
-            # XOR Logic
+            # XOR Logic: (Good != Bad) -> Diff
+            # (-a -b -c), (a b -c), (-a b c), (a -b c)
             clauses.append([-good, -bad, -diff])
             clauses.append([good, bad, -diff])
             clauses.append([-good, bad, diff])

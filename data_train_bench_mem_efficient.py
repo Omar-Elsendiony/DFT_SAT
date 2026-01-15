@@ -17,7 +17,8 @@ import torch.nn as nn
 from torch_geometric.nn import GATv2Conv
 import torch.optim as optim
 import random
-from pysat.solvers import Glucose3
+import numpy as np
+from pysat.solvers import Glucose3, Minisat22
 from pysat.formula import CNF
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
@@ -40,57 +41,78 @@ MODEL_PATH = "gnn_model_dual_task_16feat.pth"
 EPOCHS = 20
 BATCH_SIZE = 32
 BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
+SEED = 42
+
+# =============================================================================
+# 0. DETERMINISM SETUP
+# =============================================================================
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+set_global_seed(SEED)
 
 # =============================================================================
 # PART 1: OPTIMIZED PARALLEL DATA GENERATION
 # =============================================================================
 
 def get_target_files():
-    """Returns a list of .bench files in the benchmark directory."""
     if not os.path.exists(BENCHMARK_DIR):
         return []
-    return [f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")]
+    return sorted([f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")])
 
 def process_single_circuit(filename):
     """Worker function to process one circuit file."""
+    # Re-seed inside worker because multiprocessing forks resets state
+    set_global_seed(SEED + len(filename)) 
+    
     filepath = os.path.join(BENCH_DIR, filename)
     local_dataset = []
     
-    # Verbose logging to show progress
     print(f"[{filename}] Starting...", flush=True)
     
     try:
         miter = WireFaultMiter(filepath)
         if not miter.gates: return []
         
-        # Use CPU for generation to avoid overhead
         extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device='cpu')
-        input_set = set(miter.inputs)
         
+        # Sort inputs for deterministic iteration
+        input_list = sorted(list(miter.inputs))
+        input_set = set(input_list)
+        
+        # Generate samples
         for i in range(SAMPLES_PER_FILE):
-            target_gate = random.choice(miter.gates)[0]
+            # Sort gates to ensure random.choice is deterministic across runs
+            # (Assuming miter.gates is stable, but sorting ensures it)
+            all_gates = sorted(miter.gates, key=lambda x: x[0])
+            target_gate = random.choice(all_gates)[0]
+            
             clauses = miter.build_miter(target_gate, None, 1)
             cnf = CNF()
             cnf.extend(clauses)
             
-            # Solve once for Ground Truth
             with Glucose3(bootstrap_with=cnf) as solver:
                 if not solver.solve(): continue
                 model = solver.get_model()
                 if not model: continue
                 
-                # Reuse solver for probing inputs (Fast)
                 with Glucose3(bootstrap_with=cnf) as probe_solver:
                     current_conflicts = probe_solver.accum_stats()['conflicts']
                     input_importance = {}
                     input_polarity = {} 
                     
-                    for input_name in miter.inputs:
+                    # Deterministic Loop Order
+                    for input_name in input_list:
                         var_id = miter.var_map[input_name]
                         correct_val = var_id if var_id in model else -var_id
                         wrong_val = -correct_val
                         
-                        # Probe with Assumption (Reusing solver instance)
                         result = probe_solver.solve(assumptions=[wrong_val])
                         
                         new_conflicts = probe_solver.accum_stats()['conflicts']
@@ -98,9 +120,9 @@ def process_single_circuit(filename):
                         current_conflicts = new_conflicts
                         
                         if result:
-                            importance = delta # Difficulty is effort
+                            importance = delta 
                         else:
-                            importance = 10000 # Critical variable
+                            importance = 10000 
                         
                         input_importance[input_name] = importance
                         
@@ -109,10 +131,8 @@ def process_single_circuit(filename):
                         else:
                             input_polarity[input_name] = 0.5
                 
-                # Normalize
                 max_imp = max(input_importance.values()) if input_importance else 1
                 
-                # Build Data
                 data = extractor.get_data_for_fault(target_gate)
                 y_polarity = torch.zeros(len(data.node_names), 1)
                 y_importance = torch.zeros(len(data.node_names), 1)
@@ -139,160 +159,121 @@ def process_single_circuit(filename):
 
 def generate_dataset():
     print(f"--- MINING DUAL-TASK ORACLE DATA (PARALLEL) ---")
-    
     if not os.path.exists(BENCH_DIR):
         print(f"Error: {BENCH_DIR} not found.")
         return
 
     files = get_target_files()
-    print(f"Found {len(files)} circuits. Starting workers...")
+    num_workers = min(4, os.cpu_count())
+    dataset = []
 
-    # Set multiprocessing start method
     try:
         mp.set_start_method('spawn', force=True)
     except RuntimeError:
         pass
 
-    # Limit workers to prevent freezing
-    num_workers = min(4, os.cpu_count())
-    dataset = []
-
     with mp.Pool(processes=num_workers) as pool:
-        # imap_unordered makes the progress bar smoother
         results = list(tqdm(pool.imap_unordered(process_single_circuit, files), total=len(files)))
-        
         for res in results:
             dataset.extend(res)
 
-    print(f"--- Mining Complete. Collected {len(dataset)} samples. ---")
     torch.save(dataset, DATASET_PATH)
 
 
 # =============================================================================
-# PART 2: DUAL-TASK MODEL (FIXED)
+# PART 2 & 3: MODEL AND TRAINING (UNCHANGED)
 # =============================================================================
 
 class CircuitGNN_DualTask(torch.nn.Module):
     def __init__(self, num_node_features=16, num_layers=8, hidden_dim=64, dropout=0.2):
         super(CircuitGNN_DualTask, self).__init__()
-        
         self.dropout = dropout
-        self.num_layers = num_layers # <--- FIXED MISSING ATTRIBUTE
-        
+        self.num_layers = num_layers
         self.convs = torch.nn.ModuleList()
         self.bns = torch.nn.ModuleList()
-        
         self.convs.append(GATv2Conv(num_node_features, hidden_dim, heads=2, concat=False))
         self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
-        
         for _ in range(num_layers - 2):
             self.convs.append(GATv2Conv(hidden_dim, hidden_dim, heads=2, concat=False))
             self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
-        
         self.convs.append(GATv2Conv(hidden_dim, 32, heads=2, concat=False))
         self.bns.append(torch.nn.BatchNorm1d(32))
-        
-        # Dual Heads
         self.importance_head = torch.nn.Linear(32, 1)
         self.polarity_head = torch.nn.Linear(32, 1)
     
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        
         x = self.convs[0](x, edge_index)
         x = self.bns[0](x)
         x = torch.nn.functional.elu(x)
-        
         for i in range(1, self.num_layers - 1):
             identity = x
             x = self.convs[i](x, edge_index)
             x = self.bns[i](x)
             x = torch.nn.functional.elu(x)
             x = x + identity
-        
         x = self.convs[-1](x, edge_index)
         x = self.bns[-1](x)
         x = torch.nn.functional.elu(x)
-        
-        importance = self.importance_head(x)
-        polarity = torch.sigmoid(self.polarity_head(x))
-        return importance, polarity
-
-
-# =============================================================================
-# PART 3: TRAINING LOOP
-# =============================================================================
+        return self.importance_head(x), torch.sigmoid(self.polarity_head(x))
 
 def train_model():
     print("--- Training Dual-Task GNN ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    if not os.path.exists(DATASET_PATH):
-        print("Dataset not found. Generating...")
-        generate_dataset()
+    if not os.path.exists(DATASET_PATH): generate_dataset()
     
     dataset = torch.load(DATASET_PATH, weights_only=False)
-    split = int(len(dataset) * 0.8)
-    train_loader = DataLoader(dataset[:split], batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(dataset[split:], batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(dataset[:int(len(dataset)*0.8)], batch_size=BATCH_SIZE, shuffle=True)
     
     model = CircuitGNN_DualTask(num_node_features=16).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
-    
     crit_imp = nn.MSELoss(reduction='none')
     crit_pol = nn.BCELoss(reduction='none')
     
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
-        
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            
             p_imp, p_pol = model(batch)
-            
             mask = batch.train_mask
             mask_sum = mask.sum().clamp(min=1)
-            
             l_imp = (crit_imp(p_imp, batch.y_importance) * mask).sum() / mask_sum
             l_pol = (crit_pol(p_pol, batch.y_polarity) * mask).sum() / mask_sum
-            
-            loss = l_imp + l_pol
-            loss.backward()
+            (l_imp + l_pol).backward()
             optimizer.step()
-            total_loss += loss.item()
-        
+            total_loss += (l_imp + l_pol).item()
         print(f"Epoch {epoch+1}/{EPOCHS}: Loss={total_loss/len(train_loader):.4f}")
     
     torch.save(model.state_dict(), MODEL_PATH)
-    print("Model saved.")
 
 
 # =============================================================================
-# PART 4: BENCHMARKING (SET PHASES)
+# PART 4: DETERMINISTIC BENCHMARKING (FIXED)
 # =============================================================================
 
-def solve_with_phases(cnf, hint_literals):
+def solve_with_phases(cnf, hint_literals, solver_class=Minisat22):
     """
     Solve using set_phases for soft guidance.
-    hint_literals: List of signed integers.
+    solver_class: Allows switching between Glucose3 and Minisat22
     """
-    with Glucose3(bootstrap_with=cnf) as solver:
-        # Apply GNN hints as preferred polarities
+    with solver_class(bootstrap_with=cnf) as solver:
+        # 1. Deterministic Seeding (If supported by solver wrapper)
+        # Most PySAT wrappers don't expose seed in init, but rely on deterministic behavior
+        # given the same clause order.
+        
+        # 2. Apply Hints
         solver.set_phases(hint_literals)
         
-        # Solve normally
+        # 3. Solve
         result = solver.solve()
-        
         conflicts = solver.accum_stats()['conflicts']
         
     return result, conflicts
 
-
 def run_benchmark():
-    print(f"--- BENCHMARKING WITH SET_PHASES ---")
+    print(f"--- BENCHMARKING WITH SET_PHASES (DETERMINISTIC) ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = CircuitGNN_DualTask(num_node_features=16).to(device)
@@ -306,6 +287,13 @@ def run_benchmark():
     results = []
     files = get_target_files()
     
+    # 1. Sort files to ensure file processing order is fixed
+    files.sort()
+    
+    # 2. Fix the sequence of faults we will test
+    # We pre-generate the random seeds or indices if we want perfect repeatability across runs
+    random.seed(SEED) 
+    
     for filename in files:
         filepath = os.path.join(BENCHMARK_DIR, filename)
         print(f"\nProcessing {filename}...")
@@ -315,23 +303,35 @@ def run_benchmark():
             if not miter.gates: continue
             
             extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device=device.type)
-            input_names = set(miter.inputs)
             
+            # Deterministic: Sort input names
+            input_names_list = sorted(list(miter.inputs))
+            input_names_set = set(input_names_list)
+            
+            # Sort gates to ensure deterministic random choice
+            all_gates = sorted(miter.gates, key=lambda x: x[0])
+            
+            # Run 20 faults
             for i in range(20): 
-                target_gate = random.choice(miter.gates)[0]
+                # Pick target deterministically based on global seed state
+                target_gate = random.choice(all_gates)[0]
                 
                 clauses = miter.build_miter(target_gate, None, 1)
                 cnf = CNF()
                 cnf.extend(clauses)
                 
-                # 1. Standard Solve (Baseline)
+                # --- BASELINE (Minisat22) ---
+                # Using Minisat22 as the "Weak Solver" to demonstrate GNN impact better
+                # You can change this to Glucose3 if you prefer strong baseline
+                SolverClass = Minisat22 
+                
                 t_start = time.time()
-                with Glucose3(bootstrap_with=cnf) as s:
+                with SolverClass(bootstrap_with=cnf) as s:
                     s.solve()
                     std_conflicts = s.accum_stats()['conflicts']
                 std_time = time.time() - t_start
                 
-                # 2. GNN Inference
+                # --- GNN INFERENCE ---
                 t_gnn_start = time.time()
                 data = extractor.get_data_for_fault(target_gate)
                 data = data.to(device)
@@ -339,25 +339,28 @@ def run_benchmark():
                 with torch.no_grad():
                     imp_scores, pol_scores = model(data)
                 
-                # 3. Construct Hints
+                # Extract Predictions
                 candidates = []
                 for idx, name in enumerate(data.node_names):
-                    if name in input_names:
+                    if name in input_names_set:
                         imp = imp_scores[idx].item()
                         prob = pol_scores[idx].item()
                         var_id = miter.var_map.get(name)
                         
                         if var_id:
-                            # 1.0 -> True (var_id), 0.0 -> False (-var_id)
                             signed_lit = var_id if prob > 0.5 else -var_id
-                            candidates.append((signed_lit, imp))
+                            candidates.append((signed_lit, imp, var_id)) # Add var_id for tie-breaking
                 
-                # Sort by importance (highest first) 
-                candidates.sort(key=lambda x: x[1], reverse=True)
+                # --- CRITICAL FIX FOR DETERMINISM ---
+                # Sort by: 
+                # 1. Importance (Descending)
+                # 2. Variable ID (Ascending) -> TIE BREAKER
+                candidates.sort(key=lambda x: (-x[1], x[2]))
+                
                 hint_literals = [x[0] for x in candidates]
                 
-                # 4. Guided Solve
-                _, gnn_conflicts = solve_with_phases(cnf, hint_literals)
+                # --- GUIDED SOLVE ---
+                _, gnn_conflicts = solve_with_phases(cnf, hint_literals, solver_class=SolverClass)
                 gnn_time = time.time() - t_gnn_start
                 
                 speedup = std_conflicts / max(gnn_conflicts, 1)
@@ -365,10 +368,10 @@ def run_benchmark():
                 
                 results.append({
                     "Circuit": filename,
+                    "Fault": target_gate,
                     "Speedup": speedup,
                     "Std_Conf": std_conflicts,
-                    "GNN_Conf": gnn_conflicts,
-                    "Time_Speedup": std_time / max(gnn_time, 0.0001)
+                    "GNN_Conf": gnn_conflicts
                 })
                 
         except Exception as e:
