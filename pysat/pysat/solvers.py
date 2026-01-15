@@ -3734,7 +3734,7 @@ class Glucose3(object):
             
             Args:
                 variables: List of variable IDs (1-indexed) to bump activity for.
-                          Can also be integer literals (sign is ignored).
+                        Can also be integer literals (sign is ignored).
         """
 
         if self.glucose:

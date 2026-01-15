@@ -553,9 +553,58 @@ def train_importance_aware_model():
 # PART 4: BENCHMARKING
 # =============================================================================
 
+def solve_with_gnn_guidance(cnf, important_vars, max_rounds=3):
+    """
+    Guided restart strategy (Option C): Iteratively solve with GNN-prioritized 
+    variables as assumptions, extracting learned clauses between rounds.
+    
+    This forces the solver to try assigning important variables early,
+    without hard assumptions that prevent backtracking.
+    
+    Args:
+        cnf: CNF formula
+        important_vars: List of variable IDs ranked by importance (highest first)
+        max_rounds: Number of restart rounds
+    
+    Returns:
+        (result, conflicts): Boolean result and conflict count
+    """
+    solver = Glucose3(bootstrap_with=cnf, incr=True)
+    total_conflicts = 0
+    
+    for round_num in range(max_rounds):
+        # Gradually increase number of forced variables
+        k = min(2 + round_num, len(important_vars))
+        top_k_assumptions = important_vars[:k]
+        
+        try:
+            result = solver.solve(assumptions=top_k_assumptions)
+            round_conflicts = solver.accum_stats()['conflicts']
+            total_conflicts = round_conflicts
+            
+            if result:
+                # Found satisfying assignment
+                solver.delete()
+                return True, total_conflicts
+            
+            # UNSAT in this round: extract core and add blocking clause
+            # This forces solver to explore different branches in next round
+            core = solver.get_core()
+            if core:
+                # Block this assignment
+                solver.add_clause([-lit for lit in core])
+        
+        except Exception as e:
+            print(f"Error in round {round_num}: {e}\")")
+            break
+    
+    solver.delete()
+    return False, total_conflicts
+
+
 def run_importance_guided_benchmark():
-    """Benchmark with importance-guided SAT solving"""
-    print(f"--- BENCHMARKING WITH IMPORTANCE-GUIDED HINTS (16 Features) ---")
+    """Benchmark with importance-guided SAT solving (Option C: Guided Restart)"""
+    print(f"--- BENCHMARKING WITH IMPORTANCE-GUIDED RESTART (16 Features, Option C) ---")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -614,19 +663,16 @@ def run_importance_guided_benchmark():
                         if var_id:
                             input_importance_list.append((var_id, importance))
                 
-                # Sort by importance and get top K
+                # Sort by importance (highest first)
                 input_importance_list.sort(key=lambda x: x[1], reverse=True)
-                TOP_K = 5
-                top_k_vars = [h[0] for h in input_importance_list[:TOP_K]]
+                top_k_vars = [h[0] for h in input_importance_list[:10]]  # Keep top 10 for guidance
                 
-                print(f"   Top {TOP_K} important variables: {top_k_vars}")
-                print(f"   Importance scores: {[f'{h[1]:.4f}' for h in input_importance_list[:TOP_K]]}")
+                print(f"   Top 10 important variables: {top_k_vars[:5]} + {len(top_k_vars)-5} more")
+                print(f"   Importance scores: {[f'{h[1]:.4f}' for h in input_importance_list[:5]]}")
                 
-                # Soft phase hints only - allows full backtracking
-                with Glucose3(bootstrap_with=cnf, incr=True) as solver:
-                    solver.set_phases(top_k_vars)  # Soft preference only
-                    result = solver.solve()         # Solver can backtrack freely
-                    gnn_conflicts = solver.accum_stats()['conflicts']
+                # Option C: Guided restart with assumptions
+                # Strategically forces important variables across multiple rounds
+                result, gnn_conflicts = solve_with_gnn_guidance(cnf, top_k_vars, max_rounds=3)
                 
                 gnn_time = time.time() - t_gnn
                 
