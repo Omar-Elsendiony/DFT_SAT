@@ -1,12 +1,12 @@
 """
-Complete pipeline for Dual-Task GNN training with Polarity Guidance.
-Uses 'set_phases' for soft constraints instead of hard assumptions.
+Complete pipeline for Dual-Task GNN training with Parallel Generation & Polarity Guidance.
+Uses 'set_phases' for soft solver constraints.
 """
 
 import os
 import sys
 
-# Add cloned PySAT to path
+# Add local PySAT if needed
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pysat'))
 
 import time
@@ -25,8 +25,9 @@ from torch_geometric.data import Dataset
 from WireFaultMiter import WireFaultMiter
 from BenchParser import BenchParser
 from torch_geometric.data import Data
+import torch.multiprocessing as mp
 
-# IMPORT THE OPTIMIZED EXTRACTOR
+# IMPORT THE EXTRACTOR
 from neuro_utils import VectorizedGraphExtractor
 
 # =============================================================================
@@ -41,120 +42,142 @@ BATCH_SIZE = 32
 BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
 
 # =============================================================================
-# PART 1: DATA GENERATION
+# PART 1: OPTIMIZED PARALLEL DATA GENERATION
 # =============================================================================
 
 def get_target_files():
+    """Returns a list of .bench files in the benchmark directory."""
     if not os.path.exists(BENCHMARK_DIR):
         return []
     return [f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")]
 
-def generate_dataset():
-    print(f"--- MINING DUAL-TASK ORACLE DATA ---")
-    dataset = []
+def process_single_circuit(filename):
+    """Worker function to process one circuit file."""
+    filepath = os.path.join(BENCH_DIR, filename)
+    local_dataset = []
     
-    if not os.path.exists(BENCH_DIR):
-        print(f"Error: {BENCH_DIR} not found.")
-        return
+    # Verbose logging to show progress
+    print(f"[{filename}] Starting...", flush=True)
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Extractor running on: {device}")
-
-    files = [f for f in os.listdir(BENCH_DIR) if f.endswith('.bench')]
-    
-    for filename in tqdm(files, desc="Mining Circuits"):
-        filepath = os.path.join(BENCH_DIR, filename)
+    try:
+        miter = WireFaultMiter(filepath)
+        if not miter.gates: return []
         
-        try:
-            miter = WireFaultMiter(filepath)
-            if not miter.gates: continue
+        # Use CPU for generation to avoid overhead
+        extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device='cpu')
+        input_set = set(miter.inputs)
+        
+        for i in range(SAMPLES_PER_FILE):
+            target_gate = random.choice(miter.gates)[0]
+            clauses = miter.build_miter(target_gate, None, 1)
+            cnf = CNF()
+            cnf.extend(clauses)
             
-            # Use Vectorized Extractor
-            extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device=device)
-            input_set = set(miter.inputs)
-            
-            for _ in range(SAMPLES_PER_FILE):
-                target_gate = random.choice(miter.gates)[0]
-                clauses = miter.build_miter(target_gate, None, 1)
-                cnf = CNF()
-                cnf.extend(clauses)
+            # Solve once for Ground Truth
+            with Glucose3(bootstrap_with=cnf) as solver:
+                if not solver.solve(): continue
+                model = solver.get_model()
+                if not model: continue
                 
-                # 1. Get Ground Truth Model
-                with Glucose3(bootstrap_with=cnf) as solver:
-                    if not solver.solve(): continue
-                    model = solver.get_model()
-                    if not model: continue
-                    
-                    base_conflicts = solver.accum_stats()['conflicts']
+                # Reuse solver for probing inputs (Fast)
+                with Glucose3(bootstrap_with=cnf) as probe_solver:
+                    current_conflicts = probe_solver.accum_stats()['conflicts']
                     input_importance = {}
                     input_polarity = {} 
                     
-                    # 2. Analyze Inputs
                     for input_name in miter.inputs:
                         var_id = miter.var_map[input_name]
                         correct_val = var_id if var_id in model else -var_id
                         wrong_val = -correct_val
                         
-                        test_cnf = CNF()
-                        test_cnf.extend(clauses)
+                        # Probe with Assumption (Reusing solver instance)
+                        result = probe_solver.solve(assumptions=[wrong_val])
                         
-                        with Glucose3(bootstrap_with=test_cnf) as test_solver:
-                            # Check how hard it is if we force the WRONG value
-                            result = test_solver.solve(assumptions=[wrong_val])
-                            
-                            if result:
-                                wrong_conflicts = test_solver.accum_stats()['conflicts']
-                                importance = abs(wrong_conflicts - base_conflicts)
-                            else:
-                                # UNSAT implies this variable is critical
-                                importance = 10000
+                        new_conflicts = probe_solver.accum_stats()['conflicts']
+                        delta = new_conflicts - current_conflicts
+                        current_conflicts = new_conflicts
+                        
+                        if result:
+                            importance = delta # Difficulty is effort
+                        else:
+                            importance = 10000 # Critical variable
                         
                         input_importance[input_name] = importance
                         
-                        # Polarity Target (1.0 = True preferred, 0.0 = False preferred)
                         if importance > 0:
                             input_polarity[input_name] = 1.0 if var_id in model else 0.0
                         else:
-                            input_polarity[input_name] = 0.5 # Doesn't matter
-                    
-                    # Normalize
-                    max_imp = max(input_importance.values()) if input_importance else 1
-                    
-                    # 3. Build Graph Data
-                    data = extractor.get_data_for_fault(target_gate)
-                    data = data.to('cpu')
-
-                    y_polarity = torch.zeros(len(data.node_names), 1)
-                    y_importance = torch.zeros(len(data.node_names), 1)
-                    train_mask = torch.zeros(len(data.node_names), 1)
-                    
-                    for i, node_name in enumerate(data.node_names):
-                        if node_name in input_set:
-                            y_polarity[i] = input_polarity.get(node_name, 0.5)
-                            y_importance[i] = input_importance.get(node_name, 0) / max(max_imp, 1)
-                            train_mask[i] = 1.0
-                    
-                    data.y_polarity = y_polarity
-                    data.y_importance = y_importance
-                    data.train_mask = train_mask
-                    
-                    dataset.append(data)
-        
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-            continue
+                            input_polarity[input_name] = 0.5
+                
+                # Normalize
+                max_imp = max(input_importance.values()) if input_importance else 1
+                
+                # Build Data
+                data = extractor.get_data_for_fault(target_gate)
+                y_polarity = torch.zeros(len(data.node_names), 1)
+                y_importance = torch.zeros(len(data.node_names), 1)
+                train_mask = torch.zeros(len(data.node_names), 1)
+                
+                for i, node_name in enumerate(data.node_names):
+                    if node_name in input_set:
+                        y_polarity[i] = input_polarity.get(node_name, 0.5)
+                        y_importance[i] = input_importance.get(node_name, 0) / max(max_imp, 1)
+                        train_mask[i] = 1.0
+                
+                data.y_polarity = y_polarity
+                data.y_importance = y_importance
+                data.train_mask = train_mask
+                
+                local_dataset.append(data)
     
-    print(f"--- Collected {len(dataset)} samples. ---")
+    except Exception as e:
+        print(f"[{filename}] Error: {e}", flush=True)
+        return []
+
+    print(f"[{filename}] Finished. Generated {len(local_dataset)} samples.", flush=True)
+    return local_dataset
+
+def generate_dataset():
+    print(f"--- MINING DUAL-TASK ORACLE DATA (PARALLEL) ---")
+    
+    if not os.path.exists(BENCH_DIR):
+        print(f"Error: {BENCH_DIR} not found.")
+        return
+
+    files = get_target_files()
+    print(f"Found {len(files)} circuits. Starting workers...")
+
+    # Set multiprocessing start method
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+    # Limit workers to prevent freezing
+    num_workers = min(4, os.cpu_count())
+    dataset = []
+
+    with mp.Pool(processes=num_workers) as pool:
+        # imap_unordered makes the progress bar smoother
+        results = list(tqdm(pool.imap_unordered(process_single_circuit, files), total=len(files)))
+        
+        for res in results:
+            dataset.extend(res)
+
+    print(f"--- Mining Complete. Collected {len(dataset)} samples. ---")
     torch.save(dataset, DATASET_PATH)
 
 
 # =============================================================================
-# PART 2: DUAL-TASK MODEL
+# PART 2: DUAL-TASK MODEL (FIXED)
 # =============================================================================
 
 class CircuitGNN_DualTask(torch.nn.Module):
     def __init__(self, num_node_features=16, num_layers=8, hidden_dim=64, dropout=0.2):
         super(CircuitGNN_DualTask, self).__init__()
+        
+        self.dropout = dropout
+        self.num_layers = num_layers # <--- FIXED MISSING ATTRIBUTE
         
         self.convs = torch.nn.ModuleList()
         self.bns = torch.nn.ModuleList()
@@ -254,10 +277,7 @@ def train_model():
 def solve_with_phases(cnf, hint_literals):
     """
     Solve using set_phases for soft guidance.
-    hint_literals: List of signed integers (e.g., [-1, 5]).
-                   If 5 is in list, solver prefers 5=True.
-                   If -1 is in list, solver prefers 1=False.
-                   If conflict arises, solver backtracks (it is NOT an assumption).
+    hint_literals: List of signed integers.
     """
     with Glucose3(bootstrap_with=cnf) as solver:
         # Apply GNN hints as preferred polarities
@@ -320,8 +340,6 @@ def run_benchmark():
                     imp_scores, pol_scores = model(data)
                 
                 # 3. Construct Hints
-                # We collect ALL input hints, sorted by importance.
-                # set_phases can take all of them; the solver decides order.
                 candidates = []
                 for idx, name in enumerate(data.node_names):
                     if name in input_names:
@@ -330,14 +348,11 @@ def run_benchmark():
                         var_id = miter.var_map.get(name)
                         
                         if var_id:
-                            # If prob > 0.5, prefer True (var_id). 
-                            # If prob < 0.5, prefer False (-var_id).
+                            # 1.0 -> True (var_id), 0.0 -> False (-var_id)
                             signed_lit = var_id if prob > 0.5 else -var_id
                             candidates.append((signed_lit, imp))
                 
-                # Sort by importance (highest first) so we know which are "strongest" suggestions
-                # Though set_phases takes a flat list, we might want to prioritize top ones if we limited list size.
-                # Here we pass ALL hints.
+                # Sort by importance (highest first) 
                 candidates.sort(key=lambda x: x[1], reverse=True)
                 hint_literals = [x[0] for x in candidates]
                 
