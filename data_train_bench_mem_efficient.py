@@ -27,7 +27,7 @@ from BenchParser import BenchParser
 from torch_geometric.data import Data
 
 # IMPORT THE OPTIMIZED EXTRACTOR
-from VectorizedGraphExtractor import VectorizedGraphExtractor
+from neuro_utils import VectorizedGraphExtractor
 
 # =============================================================================
 # CONFIGS
