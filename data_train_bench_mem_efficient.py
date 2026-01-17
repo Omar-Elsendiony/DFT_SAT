@@ -40,7 +40,7 @@ SAMPLES_PER_FILE = 50
 MODEL_PATH = "gnn_model_dual_task_16feat.pth"
 EPOCHS = 20
 BATCH_SIZE = 32
-BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
+BENCHMARK_DIR = "../I99T"
 SEED = 42
 
 # =============================================================================
@@ -61,19 +61,43 @@ set_global_seed(SEED)
 # PART 1: OPTIMIZED PARALLEL DATA GENERATION
 # =============================================================================
 
+# def get_target_files():
+#     if not os.path.exists(BENCHMARK_DIR):
+#         return []
+#     return sorted([f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")])
+
 def get_target_files():
     if not os.path.exists(BENCHMARK_DIR):
         return []
-    return sorted([f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")])
+        
+    file_list = []
+    # os.walk recursively visits every subdirectory
+    for root, dirs, files in os.walk(BENCHMARK_DIR):
+        for f in files:
+            if f.endswith(".bench"):
+                # Get the full absolute path
+                full_path = os.path.join(root, f)
+                
+                # Convert it to a path relative to BENCHMARK_DIR 
+                # e.g., converts "/usr/bench/subdir/c17.bench" -> "subdir/c17.bench"
+                # This ensures the os.path.join(BENCH_DIR, filename) in your worker still works.
+                rel_path = os.path.relpath(full_path, BENCHMARK_DIR)
+                file_list.append(rel_path)
+                
+    return sorted(file_list)
+
 
 def process_single_circuit(filename):
-    """Worker function to process one circuit file."""
-    # Re-seed inside worker because multiprocessing forks resets state
+    """Worker function with TIMEOUTS and CONFLICT LIMITS."""
     set_global_seed(SEED + len(filename)) 
     
-    filepath = os.path.join(BENCH_DIR, filename)
+    filepath = os.path.join(BENCHMARK_DIR, filename)
     local_dataset = []
     
+    # 1. Skip if file is too large (Optional, but safe)
+    # if os.path.getsize(filepath) > 1024 * 1024 * 5: # Skip files > 5MB
+    #     return []
+
     print(f"[{filename}] Starting...", flush=True)
     
     try:
@@ -81,15 +105,17 @@ def process_single_circuit(filename):
         if not miter.gates: return []
         
         extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device='cpu')
-        
-        # Sort inputs for deterministic iteration
         input_list = sorted(list(miter.inputs))
         input_set = set(input_list)
         
+        # Limit inputs for probing if there are too many (Speedup for large circuits)
+        # If > 100 inputs, only probe a random 100 to save time
+        probe_list = input_list
+        if len(input_list) > 100:
+             probe_list = random.sample(input_list, 100)
+
         # Generate samples
         for i in range(SAMPLES_PER_FILE):
-            # Sort gates to ensure random.choice is deterministic across runs
-            # (Assuming miter.gates is stable, but sorting ensures it)
             all_gates = sorted(miter.gates, key=lambda x: x[0])
             target_gate = random.choice(all_gates)[0]
             
@@ -98,21 +124,38 @@ def process_single_circuit(filename):
             cnf.extend(clauses)
             
             with Glucose3(bootstrap_with=cnf) as solver:
-                if not solver.solve(): continue
+                # --- FIX 1: Add Conflict Budget ---
+                # If it takes > 10,000 conflicts, assume it's "Hard" and skip it.
+                solver.conf_budget(10000) 
+                
+                if not solver.solve(): 
+                    # Could be UNSAT or Budget Exceeded. either way, skip.
+                    continue
+                    
                 model = solver.get_model()
                 if not model: continue
                 
+                # Setup Probe Solver
                 with Glucose3(bootstrap_with=cnf) as probe_solver:
                     current_conflicts = probe_solver.accum_stats()['conflicts']
                     input_importance = {}
                     input_polarity = {} 
                     
-                    # Deterministic Loop Order
-                    for input_name in input_list:
+                    # Safety Timer for this specific sample
+                    start_probe_time = time.time()
+                    
+                    for input_name in probe_list:
+                        # --- FIX 2: Break if taking too long ---
+                        if time.time() - start_probe_time > 15.0: # Max 5 seconds per sample
+                            break
+
                         var_id = miter.var_map[input_name]
                         correct_val = var_id if var_id in model else -var_id
                         wrong_val = -correct_val
                         
+                        # --- FIX 3: Budget for Probes ---
+                        # Probes should be fast. Give them a tiny budget.
+                        probe_solver.conf_budget(1000)
                         result = probe_solver.solve(assumptions=[wrong_val])
                         
                         new_conflicts = probe_solver.accum_stats()['conflicts']
@@ -131,18 +174,22 @@ def process_single_circuit(filename):
                         else:
                             input_polarity[input_name] = 0.5
                 
+                # (Data Construction Code - Same as before)
+                if not input_importance: continue # Skip if we timed out before getting any data
+
                 max_imp = max(input_importance.values()) if input_importance else 1
-                
                 data = extractor.get_data_for_fault(target_gate)
                 y_polarity = torch.zeros(len(data.node_names), 1)
                 y_importance = torch.zeros(len(data.node_names), 1)
                 train_mask = torch.zeros(len(data.node_names), 1)
                 
-                for i, node_name in enumerate(data.node_names):
+                for k, node_name in enumerate(data.node_names):
                     if node_name in input_set:
-                        y_polarity[i] = input_polarity.get(node_name, 0.5)
-                        y_importance[i] = input_importance.get(node_name, 0) / max(max_imp, 1)
-                        train_mask[i] = 1.0
+                        # Only mask if we actually probed it
+                        if node_name in input_importance:
+                            y_polarity[k] = input_polarity.get(node_name, 0.5)
+                            y_importance[k] = input_importance.get(node_name, 0) / max(max_imp, 1)
+                            train_mask[k] = 1.0
                 
                 data.y_polarity = y_polarity
                 data.y_importance = y_importance
@@ -185,7 +232,7 @@ def generate_dataset():
 # =============================================================================
 
 class CircuitGNN_DualTask(torch.nn.Module):
-    def __init__(self, num_node_features=16, num_layers=8, hidden_dim=64, dropout=0.2):
+    def __init__(self, num_node_features=16, num_layers=20, hidden_dim=64, dropout=0.2):
         super(CircuitGNN_DualTask, self).__init__()
         self.dropout = dropout
         self.num_layers = num_layers
