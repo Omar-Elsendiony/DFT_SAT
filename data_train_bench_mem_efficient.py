@@ -88,34 +88,56 @@ def get_target_files():
 
 
 def process_single_circuit(filename):
-    """Worker function with TIMEOUTS and CONFLICT LIMITS."""
+    """Worker with TIERED SAMPLING and GIANT SKIP."""
     set_global_seed(SEED + len(filename)) 
     
     filepath = os.path.join(BENCHMARK_DIR, filename)
     local_dataset = []
-    
-    # 1. Skip if file is too large (Optional, but safe)
-    # if os.path.getsize(filepath) > 1024 * 1024 * 5: # Skip files > 5MB
-    #     return []
 
-    print(f"[{filename}] Starting...", flush=True)
-    
     try:
+        # 1. Quick Gate Count Check (Avoid parsing massive files if possible)
+        # (We parse it anyway here for simplicity, but in production you'd grep the file first)
         miter = WireFaultMiter(filepath)
+        num_gates = len(miter.gates)
         if not miter.gates: return []
         
+        # =========================================================
+        # TIERED SAMPLING STRATEGY
+        # =========================================================
+        if num_gates > 20000:
+            # TIER 3: GIANTS (b17, b18, b19) -> SKIP
+            # These are too big for a single-threaded Python loop in a tutorial.
+            print(f"[{filename}] SKIPPING Giant Circuit ({num_gates} gates).", flush=True)
+            return []
+            
+        elif num_gates > 4000:
+            # TIER 2: MEDIUM (b14, b15) -> REDUCED
+            local_samples = 5   # Only 5 samples
+            max_probes = 20     # Only probe 20 inputs
+            probe_time_limit = 2.0
+            print(f"[{filename}] Medium Circuit ({num_gates} gates). Reducing to {local_samples} samples.", flush=True)
+            
+        else:
+            # TIER 1: SMALL -> FULL
+            local_samples = SAMPLES_PER_FILE
+            max_probes = 100
+            probe_time_limit = 5.0
+
         extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device='cpu')
         input_list = sorted(list(miter.inputs))
         input_set = set(input_list)
         
-        # Limit inputs for probing if there are too many (Speedup for large circuits)
-        # If > 100 inputs, only probe a random 100 to save time
+        # Probe Sampling
         probe_list = input_list
-        if len(input_list) > 100:
-             probe_list = random.sample(input_list, 100)
+        if len(input_list) > max_probes:
+             probe_list = random.sample(input_list, max_probes)
 
         # Generate samples
-        for i in range(SAMPLES_PER_FILE):
+        for i in range(local_samples):
+            # VISUAL FEEDBACK
+            if i % 5 == 0:
+                print(f"[{filename}] Processing sample {i+1}/{local_samples}...", flush=True)
+
             all_gates = sorted(miter.gates, key=lambda x: x[0])
             target_gate = random.choice(all_gates)[0]
             
@@ -124,37 +146,28 @@ def process_single_circuit(filename):
             cnf.extend(clauses)
             
             with Glucose3(bootstrap_with=cnf) as solver:
-                # --- FIX 1: Add Conflict Budget ---
-                # If it takes > 10,000 conflicts, assume it's "Hard" and skip it.
                 solver.conf_budget(10000) 
-                
-                if not solver.solve(): 
-                    # Could be UNSAT or Budget Exceeded. either way, skip.
-                    continue
+                if not solver.solve(): continue
                     
                 model = solver.get_model()
                 if not model: continue
                 
-                # Setup Probe Solver
                 with Glucose3(bootstrap_with=cnf) as probe_solver:
                     current_conflicts = probe_solver.accum_stats()['conflicts']
                     input_importance = {}
                     input_polarity = {} 
                     
-                    # Safety Timer for this specific sample
                     start_probe_time = time.time()
                     
                     for input_name in probe_list:
-                        # --- FIX 2: Break if taking too long ---
-                        if time.time() - start_probe_time > 15.0: # Max 5 seconds per sample
+                        # DYNAMIC TIMEOUT
+                        if time.time() - start_probe_time > probe_time_limit: 
                             break
 
                         var_id = miter.var_map[input_name]
                         correct_val = var_id if var_id in model else -var_id
                         wrong_val = -correct_val
                         
-                        # --- FIX 3: Budget for Probes ---
-                        # Probes should be fast. Give them a tiny budget.
                         probe_solver.conf_budget(1000)
                         result = probe_solver.solve(assumptions=[wrong_val])
                         
@@ -165,17 +178,15 @@ def process_single_circuit(filename):
                         if result:
                             importance = delta 
                         else:
-                            importance = 10000 
+                            importance = 5000 
                         
                         input_importance[input_name] = importance
-                        
                         if importance > 0:
                             input_polarity[input_name] = 1.0 if var_id in model else 0.0
                         else:
                             input_polarity[input_name] = 0.5
                 
-                # (Data Construction Code - Same as before)
-                if not input_importance: continue # Skip if we timed out before getting any data
+                if not input_importance: continue 
 
                 max_imp = max(input_importance.values()) if input_importance else 1
                 data = extractor.get_data_for_fault(target_gate)
@@ -185,7 +196,6 @@ def process_single_circuit(filename):
                 
                 for k, node_name in enumerate(data.node_names):
                     if node_name in input_set:
-                        # Only mask if we actually probed it
                         if node_name in input_importance:
                             y_polarity[k] = input_polarity.get(node_name, 0.5)
                             y_importance[k] = input_importance.get(node_name, 0) / max(max_imp, 1)
@@ -194,7 +204,6 @@ def process_single_circuit(filename):
                 data.y_polarity = y_polarity
                 data.y_importance = y_importance
                 data.train_mask = train_mask
-                
                 local_dataset.append(data)
     
     except Exception as e:
@@ -267,7 +276,8 @@ class CircuitGNN_DualTask(torch.nn.Module):
 def train_model():
     print("--- Training Dual-Task GNN ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if not os.path.exists(DATASET_PATH): generate_dataset()
+    # if not os.path.exists(DATASET_PATH): generate_dataset()
+    if not os.path.exists(DATASET_PATH): print("Dataset not found. Please generate dataset first."); return
     
     dataset = torch.load(DATASET_PATH, weights_only=False)
     train_loader = DataLoader(dataset[:int(len(dataset)*0.8)], batch_size=BATCH_SIZE, shuffle=True)
