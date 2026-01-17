@@ -34,13 +34,13 @@ from neuro_utils import VectorizedGraphExtractor
 # =============================================================================
 # CONFIGS
 # =============================================================================
-BENCH_DIR = "../hdl-benchmarks/iscas85/bench/"
+BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
 DATASET_PATH = "dataset_oracle_dual_16feat.pt"
 SAMPLES_PER_FILE = 50
 MODEL_PATH = "gnn_model_dual_task_16feat.pth"
 EPOCHS = 20
 BATCH_SIZE = 32
-BENCHMARK_DIR = "../I99T"
+GENERATE_TRAIN_DATA_DIR = "../I99T"
 SEED = 42
 
 # =============================================================================
@@ -66,13 +66,13 @@ set_global_seed(SEED)
 #         return []
 #     return sorted([f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")])
 
-def get_target_files():
-    if not os.path.exists(BENCHMARK_DIR):
+def get_target_files(DIR):
+    if not os.path.exists(DIR):
         return []
         
     file_list = []
     # os.walk recursively visits every subdirectory
-    for root, dirs, files in os.walk(BENCHMARK_DIR):
+    for root, dirs, files in os.walk(DIR):
         for f in files:
             if f.endswith(".bench"):
                 # Get the full absolute path
@@ -80,8 +80,8 @@ def get_target_files():
                 
                 # Convert it to a path relative to BENCHMARK_DIR 
                 # e.g., converts "/usr/bench/subdir/c17.bench" -> "subdir/c17.bench"
-                # This ensures the os.path.join(BENCH_DIR, filename) in your worker still works.
-                rel_path = os.path.relpath(full_path, BENCHMARK_DIR)
+                # This ensures the os.path.join(DIR, filename) in your worker still works.
+                rel_path = os.path.relpath(full_path, DIR)
                 file_list.append(rel_path)
                 
     return sorted(file_list)
@@ -91,7 +91,7 @@ def process_single_circuit(filename):
     """Worker with TIERED SAMPLING and GIANT SKIP."""
     set_global_seed(SEED + len(filename)) 
     
-    filepath = os.path.join(BENCHMARK_DIR, filename)
+    filepath = os.path.join(GENERATE_TRAIN_DATA_DIR, filename)
     local_dataset = []
 
     try:
@@ -215,11 +215,11 @@ def process_single_circuit(filename):
 
 def generate_dataset():
     print(f"--- MINING DUAL-TASK ORACLE DATA (PARALLEL) ---")
-    if not os.path.exists(BENCH_DIR):
-        print(f"Error: {BENCH_DIR} not found.")
+    if not os.path.exists(GENERATE_TRAIN_DATA_DIR):
+        print(f"Error: {GENERATE_TRAIN_DATA_DIR} not found.")
         return
 
-    files = get_target_files()
+    files = get_target_files(GENERATE_TRAIN_DATA_DIR)
     num_workers = min(4, os.cpu_count())
     dataset = []
 
@@ -342,7 +342,7 @@ def run_benchmark():
     model.eval()
     
     results = []
-    files = get_target_files()
+    files = get_target_files(BENCHMARK_DIR)
     
     # 1. Sort files to ensure file processing order is fixed
     files.sort()
