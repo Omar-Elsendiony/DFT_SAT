@@ -1,27 +1,19 @@
 import os
+import random
 from collections import deque
-from pysat.solvers import Glucose3
+from pysat.solvers import Glucose3, Minisat22
 from BenchParser import BenchParser
 
 class WireFaultMiter:
     def __init__(self, bench_file):
         self.bench_file = bench_file
-        
-        # Use shared parser
         self.parser = BenchParser(bench_file)
-        
-        # Extract data from parser
-        self.inputs = self.parser.all_inputs      # PIs + PPIs
-        self.outputs = self.parser.all_outputs    # POs + PPOs
+        self.inputs = self.parser.all_inputs      
+        self.outputs = self.parser.all_outputs    
         self.gates = self.parser.gates
-        
-        # Build variable map (Deterministic from Parser)
         self.var_map = self.parser.build_var_map()
         self.next_var = len(self.var_map) + 1
-        
-        # Faulty circuit mapping
         self.faulty_map = {}
-        
         self.scan_inputs = self.parser.ppis
         self.scan_outputs = self.parser.ppos
 
@@ -31,12 +23,9 @@ class WireFaultMiter:
             self.next_var += 1
         return self.var_map[name]
 
-    # =========================================================================
-    # OPTIMIZATION METHODS
-    # =========================================================================
+    # --- OPTIMIZATION METHODS ---
 
     def get_reachable_outputs(self, fault_wire):
-        """Forward BFS: Find which POs observe the fault."""
         reachable_pos = set()
         queue = deque([fault_wire])
         visited = {fault_wire}
@@ -51,7 +40,6 @@ class WireFaultMiter:
         return list(reachable_pos)
 
     def get_logic_cone(self, target_outputs, fault_wire):
-        """Backward BFS: Minimal gates for target outputs."""
         relevant_gates = set()
         queue = deque(list(target_outputs) + [fault_wire])
         visited = set(list(target_outputs) + [fault_wire])
@@ -64,11 +52,9 @@ class WireFaultMiter:
                     if inp not in visited:
                         visited.add(inp)
                         queue.append(inp)
-        # Sort for determinism
         return sorted(list(relevant_gates), key=lambda x: x[0])
 
     def get_branchless_implications(self, fault_wire, target_val):
-        """Trace branch-less stem to force values."""
         forced = {}
         curr, val = fault_wire, target_val
         while True:
@@ -79,7 +65,6 @@ class WireFaultMiter:
             
             g_type, inputs = self.parser.gate_dict[curr]
             
-            # Logic inversion
             if g_type == 'NOT': n_val = 1 - val
             elif g_type == 'BUFF': n_val = val
             elif g_type == 'AND' and val == 1: 
@@ -102,23 +87,26 @@ class WireFaultMiter:
 
     def solve_fault_specific_cones(self, fault_wire, fault_type=1, gnn_hints=None):
         """
-        Solves using Split-Cone + Size Sorting + Branchless + GNN Hints.
-        Returns: (Assignment_Dict, Total_Conflicts)
+        Solves using Split-Cone + Heuristic Sorting + Branchless + GNN Hints.
         """
         possible_outputs = self.get_reachable_outputs(fault_wire)
         if not possible_outputs: return None, 0
         
-        # Sort by cone size (smallest first for Speedup)
+        # Sample outputs to avoid hang on large circuits
+        sample_size = min(20, len(possible_outputs))
+        sampled_subset = random.sample(possible_outputs, sample_size)
+        remaining_subset = list(set(possible_outputs) - set(sampled_subset))
+        
         candidates = []
-        for po in possible_outputs:
+        for po in sampled_subset:
             cone = self.get_logic_cone([po], fault_wire)
             candidates.append((len(cone), po))
+        
         candidates.sort(key=lambda x: x[0])
-        sorted_outputs = [x[1] for x in candidates]
+        sorted_outputs = [x[1] for x in candidates] + remaining_subset
 
         orig_gates, orig_outputs = self.gates, self.outputs
         
-        # Branch-less Analysis
         activation_val = 1 if fault_type == 0 else 0
         forced_map = self.get_branchless_implications(fault_wire, activation_val)
         
@@ -129,18 +117,26 @@ class WireFaultMiter:
             cone_gates = self.get_logic_cone([target_po], fault_wire)
             self.gates, self.outputs = cone_gates, [target_po]
             
-            # Reset Vars (Maintain Input IDs for Hint compatibility)
+            # 1. Reset Vars (Inputs must keep original IDs for hints)
             self.var_map = {name: i+1 for i, name in enumerate(self.parser.all_inputs)}
             self.next_var = len(self.var_map) + 1
             
-            # Forced Assumptions
+            # 2. POPULATE VAR_MAP FOR INTERNAL WIRES (The Missing Fix) 
+            for out, _, inputs in self.gates:
+                if out not in self.var_map:
+                    self.var_map[out] = self.next_var
+                    self.next_var += 1
+                for inp in inputs:
+                    if inp not in self.var_map:
+                        self.var_map[inp] = self.next_var
+                        self.next_var += 1
+            
             assumptions = []
             for name, val in forced_map.items():
                 if name in self.var_map:
                     lit = self.var_map[name]
                     assumptions.append(lit if val == 1 else -lit)
 
-            # GNN Phases (Dict Name -> Prob)
             phases = []
             if gnn_hints:
                 for name, prob in gnn_hints.items():
@@ -149,9 +145,11 @@ class WireFaultMiter:
                         phases.append(lit if prob > 0.5 else -lit)
 
             clauses = self.build_miter(fault_wire, fault_type)
-            with Glucose3(bootstrap_with=clauses) as solver:
-                if phases: 
-                    solver.set_phases(phases)
+            with Minisat22(bootstrap_with=clauses) as solver:
+                if phases: solver.set_phases(phases)
+                
+                # Timeout for bad cones
+                solver.conf_budget(2000) 
                 
                 result = solver.solve(assumptions=assumptions)
                 total_conflicts += solver.accum_stats()['conflicts']
@@ -175,22 +173,17 @@ class WireFaultMiter:
         return assign
 
     # --- STANDARD BUILDER ---
-
     def build_miter(self, fault_wire, fault_type=None, force_diff=1):
         clauses = []
-        
-        # 1. Good Circuit
         for out, g_type, inputs in self.gates:
             self._add_gate_clauses(clauses, self.var_map[out], g_type, [self.var_map[i] for i in inputs])
             
-        # 2. Faulty Circuit
         self.faulty_map = {name: self.var_map[name] for name in self.inputs}
         for out, _, _ in self.gates:
             if out not in self.faulty_map:
                 self.faulty_map[out] = self.next_var
                 self.next_var += 1
                 
-        # Inject Fault
         if fault_wire in self.faulty_map:
             f_var = self.faulty_map[fault_wire]
             if fault_type == 1: clauses.append([f_var])
@@ -203,7 +196,6 @@ class WireFaultMiter:
             if None in in_vars: continue 
             self._add_gate_clauses(clauses, out_var, g_type, in_vars)
 
-        # 3. Comparator
         miter_out = self.next_var; self.next_var += 1
         diff_vars = []
         unique_outputs = sorted(list(set(self.outputs)))
@@ -222,7 +214,6 @@ class WireFaultMiter:
             big_or.append(d)
         clauses.append(big_or)
         clauses.append([miter_out]) 
-        
         return clauses
 
     def _add_gate_clauses(self, clauses, out, g_type, inputs):

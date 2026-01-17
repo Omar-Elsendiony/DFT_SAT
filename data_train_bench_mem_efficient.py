@@ -85,13 +85,18 @@ def process_single_circuit(filename):
         extractor = VectorizedGraphExtractor(filepath, var_map=miter.parser.build_var_map(), device='cpu')
         
         for i in range(local_samples):
+            # 1. Pick a Fault
             target_gate = random.choice(miter.gates)[0]
             outs = miter.get_reachable_outputs(target_gate)
             if not outs: continue
             
-            candidates = [(len(miter.get_logic_cone([o], target_gate)), o) for o in outs]
+            # --- FIX FOR HANG ON B17/B19 ---
+            # Don't check all outputs. Sample 20 random ones.
+            sample_outs = random.sample(outs, min(20, len(outs)))
+            candidates = [(len(miter.get_logic_cone([o], target_gate)), o) for o in sample_outs]
             candidates.sort()
             target_out = candidates[0][1]
+            
             cone_gates = miter.get_logic_cone([target_out], target_gate)
             
             orig_gates = miter.gates; miter.gates = cone_gates
@@ -139,6 +144,11 @@ def process_single_circuit(filename):
                         data.y_importance = y_imp
                         data.train_mask = mask
                         local_dataset.append(data)
+                        
+                        # Progress print
+                        if i % 2 == 0: 
+                            print(f"[{filename}] {i+1}/{local_samples} done.", flush=True)
+
     except Exception as e:
         print(f"[{filename}] Error: {e}")
     return local_dataset
@@ -152,6 +162,10 @@ def generate_dataset():
         results = list(tqdm(pool.imap_unordered(process_single_circuit, files), total=len(files)))
         for res in results: dataset.extend(res)
     torch.save(dataset, DATASET_PATH)
+
+# =============================================================================
+# PART 2 & 3: MODEL AND TRAINING
+# =============================================================================
 
 class CircuitGNN_DualTask(torch.nn.Module):
     # --- UPDATED INPUT DIM TO 17 ---
@@ -178,35 +192,65 @@ class CircuitGNN_DualTask(torch.nn.Module):
         return self.importance_head(x), torch.sigmoid(self.polarity_head(x))
 
 def train_model():
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if not os.path.exists(DATASET_PATH): generate_dataset()
-    ds = torch.load(DATASET_PATH)
-    ldr = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
-    # --- UPDATE MODEL CALL TO 17 ---
-    model = CircuitGNN_DualTask(num_node_features=17).to(dev)
-    opt = optim.Adam(model.parameters(), lr=0.001)
-    for ep in range(EPOCHS):
+    print("--- Training Dual-Task GNN ---")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if not os.path.exists(DATASET_PATH):
+        generate_dataset()
+
+    dataset = torch.load(DATASET_PATH, weights_only=False)
+    loader = DataLoader(dataset[:int(len(dataset)*0.8)],
+                        batch_size=BATCH_SIZE,
+                        shuffle=True)
+
+    model = CircuitGNN_DualTask(num_node_features=17).to(device)
+
+    # LOAD MODEL IF IT EXISTS
+    if os.path.exists(MODEL_PATH):
+        print(f"Loading existing model from {MODEL_PATH}")
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    else:
+        print("No existing model found. Training from scratch.")
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    crit_imp = nn.MSELoss(reduction='none')
+    crit_pol = nn.BCELoss(reduction='none')
+
+    for epoch in range(EPOCHS):
         model.train()
-        loss_sum = 0
-        for batch in ldr:
-            batch = batch.to(dev)
-            opt.zero_grad()
+        total_loss = 0.0
+
+        for batch in loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+
             p_imp, p_pol = model(batch)
             mask = batch.train_mask
-            msk_sum = mask.sum().clamp(min=1)
-            l1 = (nn.MSELoss(reduction='none')(p_imp, batch.y_importance)*mask).sum()/msk_sum
-            l2 = (nn.BCELoss(reduction='none')(p_pol, batch.y_polarity)*mask).sum()/msk_sum
-            (l1+l2).backward()
-            opt.step()
-            loss_sum += (l1+l2).item()
-        print(f"Ep {ep}: {loss_sum/len(ldr):.4f}")
+            mask_sum = mask.sum().clamp(min=1)
+
+            l_imp = (crit_imp(p_imp, batch.y_importance) * mask).sum() / mask_sum
+            l_pol = (crit_pol(p_pol, batch.y_polarity) * mask).sum() / mask_sum
+
+            (l_imp + l_pol).backward()
+            optimizer.step()
+            total_loss += (l_imp + l_pol).item()
+
+        print(f"Epoch {epoch+1}: {total_loss/len(loader):.4f}")
+
     torch.save(model.state_dict(), MODEL_PATH)
+    print(f"Model saved to {MODEL_PATH}")
+
+
+# =============================================================================
+# PART 4: DETERMINISTIC BENCHMARKING (FIXED WITH OPTIMIZATION)
+# =============================================================================
 
 def run_benchmark():
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"--- BENCHMARKING (Cone Split + Branchless + GNN) ---")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # --- UPDATE MODEL CALL TO 17 ---
-    model = CircuitGNN_DualTask(num_node_features=17).to(dev)
-    if os.path.exists(MODEL_PATH): model.load_state_dict(torch.load(MODEL_PATH, map_location=dev))
+    model = CircuitGNN_DualTask(num_node_features=17).to(device)
+    if os.path.exists(MODEL_PATH): model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
     
     results = []
@@ -219,37 +263,48 @@ def run_benchmark():
         try:
             miter = WireFaultMiter(filepath)
             if not miter.gates: continue
-            extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device=dev.type)
-            all_gates = sorted(miter.gates, key=lambda x: x[0])
+            extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device=device.type)
             
+            all_gates = sorted(miter.gates, key=lambda x: x[0])
             for i in range(10): 
                 target_gate = random.choice(all_gates)[0]
                 FAULT_TYPE = 1 # SA1
                 
-                # --- GNN ---
+                # --- GNN INFERENCE ---
                 t0 = time.time()
                 # Pass fault type 1
-                data = extractor.get_data_for_fault(target_gate, fault_type=FAULT_TYPE).to(dev)
+                data = extractor.get_data_for_fault(target_gate, fault_type=FAULT_TYPE).to(device)
                 with torch.no_grad(): imp, pol = model(data)
                 
                 hints = {}
                 for idx, name in enumerate(data.node_names):
                     if name in miter.inputs: hints[name] = pol[idx].item()
                 
-                # --- Baseline ---
+                # --- 1. BASELINE RUN (No Hints) ---
                 _, conf_std = miter.solve_fault_specific_cones(target_gate, FAULT_TYPE, gnn_hints=None)
                 
-                # --- GNN ---
-                assign, conf_gnn = miter.solve_fault_specific_cones(target_gate, FAULT_TYPE, gnn_hints=hints)
+                # --- 2. GNN RUN (With Hints) ---
+                assign_gnn, conf_gnn = miter.solve_fault_specific_cones(target_gate, FAULT_TYPE, gnn_hints=hints)
                 dur = time.time() - t0
                 
                 spd = conf_std / max(conf_gnn, 1)
-                stat = "DETECTED" if assign else "UNSAT"
-                vec_str = "".join([str(assign.get(k, 'X')) for k in sorted(miter.inputs)]) if assign else "UNSAT"
-                print(f"  {target_gate}: {stat} | Conf {conf_std}->{conf_gnn} ({spd:.2f}x)")
+                status = "DETECTED" if assign_gnn else "UNSAT"
                 
-                results.append({"Circuit":filename, "Fault":target_gate, "Speedup":spd, "Std_Conf":conf_std, "GNN_Conf":conf_gnn, "Status":stat, "Vector":vec_str})
-        except Exception as e: print(f"Err {filename}: {e}")
+                if assign_gnn:
+                    vec_str = "".join([str(assign_gnn.get(k, 'X')) for k in sorted(miter.inputs)])
+                    print(f"  {target_gate}: {status} | Conf: {conf_std} -> {conf_gnn} ({spd:.2f}x)")
+                    print(f"  Vector: {vec_str[:30]}...")
+                else:
+                    vec_str = "UNSAT"
+                    print(f"  {target_gate}: {status} | Conf: {conf_std} -> {conf_gnn} ({spd:.2f}x)")
+                
+                results.append({
+                    "Circuit": filename, "Fault": target_gate, "Speedup": spd,
+                    "Std_Conf": conf_std, "GNN_Conf": conf_gnn, "Status": status,
+                    "Vector": vec_str
+                })
+        except Exception as e:
+            print(f"Error: {e}")
 
     if results:
         with open("results_optimized.csv", 'w', newline='') as f:
