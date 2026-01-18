@@ -1028,3 +1028,1033 @@ class VectorizedGraphExtractor:
                 x[mask_visited, 11] = 1.0 - (dist[mask_visited] / max_d)
                 
         return Data(x=x, edge_index=self.edge_index, node_names=self.ordered_names)
+===== BenchParser.py =====
+"""
+Shared Bench File Parser for DFT Analysis
+
+This module provides a unified parser for .bench files that:
+- Handles full-scan DFFs (Q output as PPI, D input as PPO)
+- Tracks back edges for bidirectional graph traversal
+- Provides a common data structure for both SAT and GNN models
+"""
+
+class BenchParser:
+    """
+    Unified parser for .bench format files with full-scan DFF support.
+    
+    For full-scan designs:
+    - DFF outputs (Q) are treated as Pseudo Primary Inputs (PPIs)
+    - DFF inputs (D) are treated as Pseudo Primary Outputs (PPOs)
+    - The circuit is "broken" at flip-flops to eliminate cycles
+    """
+    
+    def __init__(self, bench_file):
+        self.bench_file = bench_file
+        
+        # Primary Inputs/Outputs
+        self.inputs = []           # Primary Inputs (PIs)
+        self.outputs = []          # Primary Outputs (POs)
+        
+        # Pseudo Inputs/Outputs (from DFFs)
+        self.ppis = []             # Pseudo Primary Inputs (DFF Q outputs)
+        self.ppos = []             # Pseudo Primary Outputs (DFF D inputs)
+        
+        # All inputs/outputs combined
+        self.all_inputs = []       # PIs + PPIs
+        self.all_outputs = []      # POs + PPOs
+        
+        # Gate structure
+        self.gates = []            # List of (output, gate_type, inputs)
+        self.gate_dict = {}        # Map: output_name -> (gate_type, inputs)
+        
+        # DFF tracking
+        self.dffs = []             # List of (Q_output, D_input) tuples
+        self.dff_map = {}          # Map: Q_output -> D_input
+        
+        # Back edges (for reverse traversal)
+        self.back_edges = {}       # Map: input_wire -> [gates_it_drives]
+        
+        # Variable mapping (for SAT solver)
+        self.var_map = {}          # Map: wire_name -> variable_id
+        
+        # Parse the file
+        self._parse()
+    
+    def _parse(self):
+        """Parse the bench file and populate all data structures."""
+        with open(self.bench_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+                
+                # Parse INPUT declarations
+                if line.startswith('INPUT'):
+                    name = line[line.find('(')+1:line.find(')')]
+                    self.inputs.append(name)
+                    self.all_inputs.append(name)
+                    
+                # Parse OUTPUT declarations
+                elif line.startswith('OUTPUT'):
+                    name = line[line.find('(')+1:line.find(')')]
+                    self.outputs.append(name)
+                    self.all_outputs.append(name)
+                    
+                # Parse gate definitions
+                elif '=' in line:
+                    parts = line.split('=')
+                    out = parts[0].strip()
+                    rhs = parts[1].strip()
+                    
+                    # Extract gate type and inputs
+                    g_type = rhs[:rhs.find('(')].strip().upper()
+                    in_str = rhs[rhs.find('(')+1:-1]
+                    inputs = [x.strip() for x in in_str.split(',')] if in_str else []
+                    
+                    # Handle DFFs specially (Full-Scan assumption)
+                    if g_type == 'DFF':
+                        # Q output (out) becomes a PPI
+                        self.ppis.append(out)
+                        self.all_inputs.append(out)
+                        
+                        # D input becomes a PPO
+                        if len(inputs) > 0:
+                            d_input = inputs[0]
+                            self.ppos.append(d_input)
+                            self.all_outputs.append(d_input)
+                            
+                            # Track the DFF relationship
+                            self.dffs.append((out, d_input))
+                            self.dff_map[out] = d_input
+                        
+                        # Note: DFFs are NOT added to self.gates
+                        # This "breaks" the circuit at flip-flops
+                    else:
+                        # Regular combinational gate
+                        self.gates.append((out, g_type, inputs))
+                        self.gate_dict[out] = (g_type, inputs)
+                        
+                        # Build back edges for reverse traversal
+                        for inp in inputs:
+                            if inp not in self.back_edges:
+                                self.back_edges[inp] = []
+                            self.back_edges[inp].append(out)
+        
+        # Remove duplicates while preserving order
+        self.all_inputs = list(dict.fromkeys(self.all_inputs))
+        self.all_outputs = list(dict.fromkeys(self.all_outputs))
+    
+    def get_all_wires(self):
+        """Get all wire names in the circuit (inputs, outputs, and internal)."""
+        wires = set(self.all_inputs + self.all_outputs)
+        for out, _, inputs in self.gates:
+            wires.add(out)
+            wires.update(inputs)
+        return sorted(list(wires))
+    
+    def build_var_map(self):
+        """Build variable mapping for SAT solver (1-indexed)."""
+        if self.var_map:
+            return self.var_map  # Already built
+        
+        next_var = 1
+        for wire in self.get_all_wires():
+            if wire not in self.var_map:
+                self.var_map[wire] = next_var
+                next_var += 1
+        return self.var_map
+    
+    def get_fanout(self, wire_name):
+        """Get all gates driven by a wire (forward edges)."""
+        return self.back_edges.get(wire_name, [])
+    
+    def get_fanin(self, wire_name):
+        """Get the gate driving a wire (backward edge)."""
+        if wire_name in self.gate_dict:
+            return self.gate_dict[wire_name][1]  # Return inputs
+        return []
+    
+    def is_pi(self, wire_name):
+        """Check if wire is a Primary Input."""
+        return wire_name in self.inputs
+    
+    def is_po(self, wire_name):
+        """Check if wire is a Primary Output."""
+        return wire_name in self.outputs
+    
+    def is_ppi(self, wire_name):
+        """Check if wire is a Pseudo Primary Input (DFF Q)."""
+        return wire_name in self.ppis
+    
+    def is_ppo(self, wire_name):
+        """Check if wire is a Pseudo Primary Output (DFF D)."""
+        return wire_name in self.ppos
+    
+    def is_dff_output(self, wire_name):
+        """Check if wire is a DFF Q output."""
+        return wire_name in self.dff_map
+    
+    def get_dff_input(self, q_output):
+        """Get the D input for a DFF Q output."""
+        return self.dff_map.get(q_output)
+    
+    def get_gate_type(self, wire_name):
+        """Get the gate type that produces this wire."""
+        if wire_name in self.gate_dict:
+            return self.gate_dict[wire_name][0]
+        elif self.is_ppi(wire_name):
+            return 'PPI'
+        elif self.is_pi(wire_name):
+            return 'INPUT'
+        return None
+    
+    def __repr__(self):
+        return (f"BenchParser({self.bench_file})\n"
+                f"  PIs: {len(self.inputs)}, POs: {len(self.outputs)}\n"
+                f"  PPIs: {len(self.ppis)}, PPOs: {len(self.ppos)}\n"
+                f"  Gates: {len(self.gates)}, DFFs: {len(self.dffs)}")
+
+===== WireFaultMiter.py =====
+import os
+from BenchParser import BenchParser
+
+class WireFaultMiter:
+    def __init__(self, bench_file):
+        self.bench_file = bench_file
+        
+        # Use shared parser
+        self.parser = BenchParser(bench_file)
+        
+        # Extract data from parser
+        self.inputs = self.parser.all_inputs      # PIs + PPIs
+        self.outputs = self.parser.all_outputs    # POs + PPOs
+        self.gates = self.parser.gates
+        
+        # Build variable map (Deterministic from Parser)
+        self.var_map = self.parser.build_var_map()
+        self.next_var = len(self.var_map) + 1
+        
+        # Faulty circuit mapping
+        self.faulty_map = {}
+        
+        self.scan_inputs = self.parser.ppis
+        self.scan_outputs = self.parser.ppos
+
+    def _get_var(self, name):
+        if name not in self.var_map:
+            self.var_map[name] = self.next_var
+            self.next_var += 1
+        return self.var_map[name]
+
+    def build_miter(self, fault_wire, fault_type=None, force_diff=1):
+        clauses = []
+        
+        # --- 1. Good Circuit ---
+        # self.gates is a list (Deterministic order from file)
+        for out, g_type, inputs in self.gates:
+            self._add_gate_clauses(clauses, self.var_map[out], g_type, [self.var_map[i] for i in inputs])
+            
+        # --- 2. Faulty Circuit ---
+        # Map inputs to same vars, but internal wires get new vars
+        # Dict insertion order is preserved in Python 3.7+, but iterating input list is safer
+        self.faulty_map = {}
+        for name in self.inputs:
+            self.faulty_map[name] = self.var_map[name]
+            
+        for out, _, _ in self.gates:
+            if out not in self.faulty_map:
+                self.faulty_map[out] = self.next_var
+                self.next_var += 1
+                
+        # Inject Fault (Stuck-at)
+        if fault_wire in self.faulty_map:
+            fault_gate_var = self.faulty_map[fault_wire]
+            if fault_type == 1: clauses.append([fault_gate_var])   # Stuck-at-1
+            elif fault_type == 0: clauses.append([-fault_gate_var]) # Stuck-at-0
+
+        for out, g_type, inputs in self.gates:
+            # If gate drives the fault wire, disconnect it (fault overrides)
+            if out == fault_wire:
+                continue
+
+            out_var = self.faulty_map[out]
+            in_vars = [self.faulty_map.get(i) for i in inputs]
+            if None in in_vars: continue 
+            self._add_gate_clauses(clauses, out_var, g_type, in_vars)
+
+        # --- 3. Miter Comparator (XOR Outputs) ---
+        miter_out = self.next_var; self.next_var += 1
+        diff_vars = []
+        
+        # --- FIX FOR DETERMINISM ---
+        # Old: unique_outputs = list(set(self.outputs)) -> Random order!
+        # New: Sorted list -> Fixed order
+        unique_outputs = sorted(list(set(self.outputs)))
+        
+        for out in unique_outputs:
+            if out not in self.var_map or out not in self.faulty_map: continue
+            
+            good = self.var_map[out]
+            bad = self.faulty_map[out]
+            diff = self.next_var; self.next_var += 1
+            
+            # XOR Logic: (Good != Bad) -> Diff
+            # (-a -b -c), (a b -c), (-a b c), (a -b c)
+            clauses.append([-good, -bad, -diff])
+            clauses.append([good, bad, -diff])
+            clauses.append([-good, bad, diff])
+            clauses.append([good, -bad, diff])
+            diff_vars.append(diff)
+            
+        # Big OR Gate (Any difference triggers Miter)
+        big_or = [-miter_out]
+        for d in diff_vars:
+            clauses.append([-d, miter_out])
+            big_or.append(d)
+        clauses.append(big_or)
+        clauses.append([miter_out]) # Force Miter = 1
+        
+        return clauses
+
+    def _add_gate_clauses(self, clauses, out, g_type, inputs):
+        if g_type == 'AND':
+            for i in inputs: clauses.append([-out, i])
+            clauses.append([out] + [-i for i in inputs])
+        elif g_type == 'OR':
+            for i in inputs: clauses.append([out, -i])
+            clauses.append([-out] + inputs)
+        elif g_type == 'NOT':
+            clauses.append([-out, -inputs[0]])
+            clauses.append([out, inputs[0]])
+        elif g_type == 'NAND':
+            for i in inputs: clauses.append([out, i])
+            clauses.append([-out] + [-i for i in inputs])
+        elif g_type == 'NOR':
+            for i in inputs: clauses.append([-out, -i])
+            clauses.append([out] + inputs)
+        elif g_type == 'XOR':
+            if len(inputs) == 2:
+                a, b = inputs
+                clauses.append([-out, -a, -b])
+                clauses.append([-out, a, b])
+                clauses.append([out, -a, b])
+                clauses.append([out, a, -b])
+        elif g_type == 'BUFF':
+             clauses.append([-out, inputs[0]])
+             clauses.append([out, -inputs[0]])
+===== data_train_bench_mem_efficient.py =====
+"""
+Complete pipeline for Dual-Task GNN training with Parallel Generation & Polarity Guidance.
+Uses 'set_phases' for soft solver constraints.
+"""
+
+import os
+import sys
+
+# Add local PySAT if needed
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pysat'))
+
+import time
+import csv
+import math
+import torch
+import torch.nn as nn
+from torch_geometric.nn import GATv2Conv
+import torch.optim as optim
+import random
+import numpy as np
+from pysat.solvers import Glucose3, Minisat22
+from pysat.formula import CNF
+from tqdm import tqdm
+from torch_geometric.loader import DataLoader
+from torch_geometric.data import Dataset
+from WireFaultMiter import WireFaultMiter
+from BenchParser import BenchParser
+from torch_geometric.data import Data
+import torch.multiprocessing as mp
+
+# IMPORT THE EXTRACTOR
+from neuro_utils import VectorizedGraphExtractor
+
+# =============================================================================
+# CONFIGS
+# =============================================================================
+BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
+DATASET_PATH = "dataset_oracle_dual_16feat.pt"
+SAMPLES_PER_FILE = 50
+MODEL_PATH = "gnn_model_dual_task_16feat.pth"
+EPOCHS = 20
+BATCH_SIZE = 32
+GENERATE_TRAIN_DATA_DIR = "../I99T"
+SEED = 42
+
+# =============================================================================
+# 0. DETERMINISM SETUP
+# =============================================================================
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+set_global_seed(SEED)
+
+# =============================================================================
+# PART 1: OPTIMIZED PARALLEL DATA GENERATION
+# =============================================================================
+
+# def get_target_files():
+#     if not os.path.exists(BENCHMARK_DIR):
+#         return []
+#     return sorted([f for f in os.listdir(BENCHMARK_DIR) if f.endswith(".bench")])
+
+def get_target_files(DIR):
+    if not os.path.exists(DIR):
+        return []
+        
+    file_list = []
+    # os.walk recursively visits every subdirectory
+    for root, dirs, files in os.walk(DIR):
+        for f in files:
+            if f.endswith(".bench"):
+                # Get the full absolute path
+                full_path = os.path.join(root, f)
+                
+                # Convert it to a path relative to BENCHMARK_DIR 
+                # e.g., converts "/usr/bench/subdir/c17.bench" -> "subdir/c17.bench"
+                # This ensures the os.path.join(DIR, filename) in your worker still works.
+                rel_path = os.path.relpath(full_path, DIR)
+                file_list.append(rel_path)
+                
+    return sorted(file_list)
+
+
+def process_single_circuit(filename):
+    """Worker with TIERED SAMPLING and GIANT SKIP."""
+    set_global_seed(SEED + len(filename)) 
+    
+    filepath = os.path.join(GENERATE_TRAIN_DATA_DIR, filename)
+    local_dataset = []
+
+    try:
+        # 1. Quick Gate Count Check (Avoid parsing massive files if possible)
+        # (We parse it anyway here for simplicity, but in production you'd grep the file first)
+        miter = WireFaultMiter(filepath)
+        num_gates = len(miter.gates)
+        if not miter.gates: return []
+        
+        # =========================================================
+        # TIERED SAMPLING STRATEGY
+        # =========================================================
+        if num_gates > 20000:
+            # TIER 3: GIANTS (b17, b18, b19) -> SKIP
+            # These are too big for a single-threaded Python loop in a tutorial.
+            print(f"[{filename}] SKIPPING Giant Circuit ({num_gates} gates).", flush=True)
+            return []
+            
+        elif num_gates > 4000:
+            # TIER 2: MEDIUM (b14, b15) -> REDUCED
+            local_samples = 5   # Only 5 samples
+            max_probes = 20     # Only probe 20 inputs
+            probe_time_limit = 2.0
+            print(f"[{filename}] Medium Circuit ({num_gates} gates). Reducing to {local_samples} samples.", flush=True)
+            
+        else:
+            # TIER 1: SMALL -> FULL
+            local_samples = SAMPLES_PER_FILE
+            max_probes = 100
+            probe_time_limit = 5.0
+
+        extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device='cpu')
+        input_list = sorted(list(miter.inputs))
+        input_set = set(input_list)
+        
+        # Probe Sampling
+        probe_list = input_list
+        if len(input_list) > max_probes:
+             probe_list = random.sample(input_list, max_probes)
+
+        # Generate samples
+        for i in range(local_samples):
+            # VISUAL FEEDBACK
+            if i % 5 == 0:
+                print(f"[{filename}] Processing sample {i+1}/{local_samples}...", flush=True)
+
+            all_gates = sorted(miter.gates, key=lambda x: x[0])
+            target_gate = random.choice(all_gates)[0]
+            
+            clauses = miter.build_miter(target_gate, None, 1)
+            cnf = CNF()
+            cnf.extend(clauses)
+            
+            with Glucose3(bootstrap_with=cnf) as solver:
+                solver.conf_budget(10000) 
+                if not solver.solve(): continue
+                    
+                model = solver.get_model()
+                if not model: continue
+                
+                with Glucose3(bootstrap_with=cnf) as probe_solver:
+                    current_conflicts = probe_solver.accum_stats()['conflicts']
+                    input_importance = {}
+                    input_polarity = {} 
+                    
+                    start_probe_time = time.time()
+                    
+                    for input_name in probe_list:
+                        # DYNAMIC TIMEOUT
+                        if time.time() - start_probe_time > probe_time_limit: 
+                            break
+
+                        var_id = miter.var_map[input_name]
+                        correct_val = var_id if var_id in model else -var_id
+                        wrong_val = -correct_val
+                        
+                        probe_solver.conf_budget(1000)
+                        result = probe_solver.solve(assumptions=[wrong_val])
+                        
+                        new_conflicts = probe_solver.accum_stats()['conflicts']
+                        delta = new_conflicts - current_conflicts
+                        current_conflicts = new_conflicts
+                        
+                        if result:
+                            importance = delta 
+                        else:
+                            importance = 5000 
+                        
+                        input_importance[input_name] = importance
+                        if importance > 0:
+                            input_polarity[input_name] = 1.0 if var_id in model else 0.0
+                        else:
+                            input_polarity[input_name] = 0.5
+                
+                if not input_importance: continue 
+
+                max_imp = max(input_importance.values()) if input_importance else 1
+                data = extractor.get_data_for_fault(target_gate)
+                y_polarity = torch.zeros(len(data.node_names), 1)
+                y_importance = torch.zeros(len(data.node_names), 1)
+                train_mask = torch.zeros(len(data.node_names), 1)
+                
+                for k, node_name in enumerate(data.node_names):
+                    if node_name in input_set:
+                        if node_name in input_importance:
+                            y_polarity[k] = input_polarity.get(node_name, 0.5)
+                            y_importance[k] = input_importance.get(node_name, 0) / max(max_imp, 1)
+                            train_mask[k] = 1.0
+                
+                data.y_polarity = y_polarity
+                data.y_importance = y_importance
+                data.train_mask = train_mask
+                local_dataset.append(data)
+    
+    except Exception as e:
+        print(f"[{filename}] Error: {e}", flush=True)
+        return []
+
+    print(f"[{filename}] Finished. Generated {len(local_dataset)} samples.", flush=True)
+    return local_dataset
+
+def generate_dataset():
+    print(f"--- MINING DUAL-TASK ORACLE DATA (PARALLEL) ---")
+    if not os.path.exists(GENERATE_TRAIN_DATA_DIR):
+        print(f"Error: {GENERATE_TRAIN_DATA_DIR} not found.")
+        return
+
+    files = get_target_files(GENERATE_TRAIN_DATA_DIR)
+    num_workers = min(4, os.cpu_count())
+    dataset = []
+
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+    with mp.Pool(processes=num_workers) as pool:
+        results = list(tqdm(pool.imap_unordered(process_single_circuit, files), total=len(files)))
+        for res in results:
+            dataset.extend(res)
+
+    torch.save(dataset, DATASET_PATH)
+
+
+# =============================================================================
+# PART 2 & 3: MODEL AND TRAINING (UNCHANGED)
+# =============================================================================
+
+class CircuitGNN_DualTask(torch.nn.Module):
+    def __init__(self, num_node_features=16, num_layers=20, hidden_dim=64, dropout=0.2):
+        super(CircuitGNN_DualTask, self).__init__()
+        self.dropout = dropout
+        self.num_layers = num_layers
+        self.convs = torch.nn.ModuleList()
+        self.bns = torch.nn.ModuleList()
+        self.convs.append(GATv2Conv(num_node_features, hidden_dim, heads=2, concat=False))
+        self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        for _ in range(num_layers - 2):
+            self.convs.append(GATv2Conv(hidden_dim, hidden_dim, heads=2, concat=False))
+            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+        self.convs.append(GATv2Conv(hidden_dim, 32, heads=2, concat=False))
+        self.bns.append(torch.nn.BatchNorm1d(32))
+        self.importance_head = torch.nn.Linear(32, 1)
+        self.polarity_head = torch.nn.Linear(32, 1)
+    
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.convs[0](x, edge_index)
+        x = self.bns[0](x)
+        x = torch.nn.functional.elu(x)
+        for i in range(1, self.num_layers - 1):
+            identity = x
+            x = self.convs[i](x, edge_index)
+            x = self.bns[i](x)
+            x = torch.nn.functional.elu(x)
+            x = x + identity
+        x = self.convs[-1](x, edge_index)
+        x = self.bns[-1](x)
+        x = torch.nn.functional.elu(x)
+        return self.importance_head(x), torch.sigmoid(self.polarity_head(x))
+
+def train_model():
+    print("--- Training Dual-Task GNN ---")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # if not os.path.exists(DATASET_PATH): generate_dataset()
+    if not os.path.exists(DATASET_PATH): print("Dataset not found. Please generate dataset first."); return
+    
+    dataset = torch.load(DATASET_PATH, weights_only=False)
+    train_loader = DataLoader(dataset[:int(len(dataset)*0.8)], batch_size=BATCH_SIZE, shuffle=True)
+    
+    model = CircuitGNN_DualTask(num_node_features=16).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    crit_imp = nn.MSELoss(reduction='none')
+    crit_pol = nn.BCELoss(reduction='none')
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            p_imp, p_pol = model(batch)
+            mask = batch.train_mask
+            mask_sum = mask.sum().clamp(min=1)
+            l_imp = (crit_imp(p_imp, batch.y_importance) * mask).sum() / mask_sum
+            l_pol = (crit_pol(p_pol, batch.y_polarity) * mask).sum() / mask_sum
+            (l_imp + l_pol).backward()
+            optimizer.step()
+            total_loss += (l_imp + l_pol).item()
+        print(f"Epoch {epoch+1}/{EPOCHS}: Loss={total_loss/len(train_loader):.4f}")
+    
+    torch.save(model.state_dict(), MODEL_PATH)
+
+
+# =============================================================================
+# PART 4: DETERMINISTIC BENCHMARKING (FIXED)
+# =============================================================================
+
+def solve_with_phases(cnf, hint_literals, solver_class=Minisat22):
+    """
+    Solve using set_phases for soft guidance.
+    solver_class: Allows switching between Glucose3 and Minisat22
+    """
+    with solver_class(bootstrap_with=cnf) as solver:
+        # 1. Deterministic Seeding (If supported by solver wrapper)
+        # Most PySAT wrappers don't expose seed in init, but rely on deterministic behavior
+        # given the same clause order.
+        
+        # 2. Apply Hints
+        solver.set_phases(hint_literals)
+        
+        # 3. Solve
+        result = solver.solve()
+        conflicts = solver.accum_stats()['conflicts']
+        
+    return result, conflicts
+
+def run_benchmark():
+    print(f"--- BENCHMARKING WITH SET_PHASES (DETERMINISTIC) ---")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    model = CircuitGNN_DualTask(num_node_features=16).to(device)
+    if not os.path.exists(MODEL_PATH):
+        print("Train model first.")
+        return
+        
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+    
+    results = []
+    files = get_target_files(BENCHMARK_DIR)
+    
+    # 1. Sort files to ensure file processing order is fixed
+    files.sort()
+    
+    # 2. Fix the sequence of faults we will test
+    # We pre-generate the random seeds or indices if we want perfect repeatability across runs
+    random.seed(SEED) 
+    
+    for filename in files:
+        filepath = os.path.join(BENCHMARK_DIR, filename)
+        print(f"\nProcessing {filename}...")
+        
+        try:
+            miter = WireFaultMiter(filepath)
+            if not miter.gates: continue
+            
+            extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device=device.type)
+            
+            # Deterministic: Sort input names
+            input_names_list = sorted(list(miter.inputs))
+            input_names_set = set(input_names_list)
+            
+            # Sort gates to ensure deterministic random choice
+            all_gates = sorted(miter.gates, key=lambda x: x[0])
+            
+            # Run 20 faults
+            for i in range(20): 
+                # Pick target deterministically based on global seed state
+                target_gate = random.choice(all_gates)[0]
+                
+                clauses = miter.build_miter(target_gate, None, 1)
+                cnf = CNF()
+                cnf.extend(clauses)
+                
+                # --- BASELINE (Minisat22) ---
+                # Using Minisat22 as the "Weak Solver" to demonstrate GNN impact better
+                # You can change this to Glucose3 if you prefer strong baseline
+                SolverClass = Minisat22 
+                
+                t_start = time.time()
+                with SolverClass(bootstrap_with=cnf) as s:
+                    s.solve()
+                    std_conflicts = s.accum_stats()['conflicts']
+                std_time = time.time() - t_start
+                
+                # --- GNN INFERENCE ---
+                t_gnn_start = time.time()
+                data = extractor.get_data_for_fault(target_gate)
+                data = data.to(device)
+                
+                with torch.no_grad():
+                    imp_scores, pol_scores = model(data)
+                
+                # Extract Predictions
+                candidates = []
+                for idx, name in enumerate(data.node_names):
+                    if name in input_names_set:
+                        imp = imp_scores[idx].item()
+                        prob = pol_scores[idx].item()
+                        var_id = miter.var_map.get(name)
+                        
+                        if var_id:
+                            signed_lit = var_id if prob > 0.5 else -var_id
+                            candidates.append((signed_lit, imp, var_id)) # Add var_id for tie-breaking
+                
+                # --- CRITICAL FIX FOR DETERMINISM ---
+                # Sort by: 
+                # 1. Importance (Descending)
+                # 2. Variable ID (Ascending) -> TIE BREAKER
+                candidates.sort(key=lambda x: (-x[1], x[2]))
+                
+                hint_literals = [x[0] for x in candidates]
+                
+                # --- GUIDED SOLVE ---
+                _, gnn_conflicts = solve_with_phases(cnf, hint_literals, solver_class=SolverClass)
+                gnn_time = time.time() - t_gnn_start
+                
+                speedup = std_conflicts / max(gnn_conflicts, 1)
+                print(f"  Fault {target_gate}: {std_conflicts} -> {gnn_conflicts} ({speedup:.2f}x)")
+                
+                results.append({
+                    "Circuit": filename,
+                    "Fault": target_gate,
+                    "Speedup": speedup,
+                    "Std_Conf": std_conflicts,
+                    "GNN_Conf": gnn_conflicts
+                })
+                
+        except Exception as e:
+            print(f"Error: {e}")
+
+    if results:
+        with open("results_set_phases.csv", 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+        print("Saved to results_set_phases.csv")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python importance_pipeline_16feat.py [generate|train|benchmark]")
+    else:
+        cmd = sys.argv[1]
+        if cmd == "generate": generate_dataset()
+        elif cmd == "train": train_model()
+        elif cmd == "benchmark": run_benchmark()
+===== neuro_utils.py =====
+import torch
+import math
+from torch_geometric.data import Data
+from BenchParser import BenchParser
+
+class VectorizedGraphExtractor:
+    """
+    High-Performance SCOAP Extractor using Vectorized Tensor Operations.
+    Generates 16-dimensional feature vectors including Observability.
+    """
+    
+    # Gate Type Mapping
+    TYPE_MAP = {
+        'INPUT': 0, 'PPI': 0, 
+        'BUFF': 1, 'NOT': 2,
+        'AND': 3, 'NAND': 4,
+        'OR': 5, 'NOR': 6,
+        'XOR': 7, 'XNOR': 7
+    }
+
+    def __init__(self, bench_path, var_map=None, device='cpu'):
+        self.parser = BenchParser(bench_path)
+        self.device = device
+        
+        # 1. Build Name Mappings (Sync with Miter if var_map provided)
+        if var_map:
+            self.var_map = var_map
+        else:
+            self.var_map = self.parser.build_var_map()
+            
+        self.ordered_names = sorted(self.var_map.keys(), key=lambda k: self.var_map[k])
+        self.name_to_idx = {name: i for i, name in enumerate(self.ordered_names)}
+        self.num_nodes = len(self.ordered_names)
+        
+        # 2. Build Structural Tensors
+        self.edges_list = []
+        self.node_types = torch.zeros(self.num_nodes, dtype=torch.long, device=device)
+        
+        # Assign Gate Types
+        for name, g_type, _ in self.parser.gates:
+            if name in self.name_to_idx:
+                idx = self.name_to_idx[name]
+                self.node_types[idx] = self.TYPE_MAP.get(g_type, 1) # Default to BUFF
+        
+        # Overwrite Types for Inputs/PPIs
+        for pi in self.parser.inputs:
+            if pi in self.name_to_idx:
+                self.node_types[self.name_to_idx[pi]] = self.TYPE_MAP['INPUT']
+        for ppi in self.parser.ppis:
+            if ppi in self.name_to_idx:
+                self.node_types[self.name_to_idx[ppi]] = self.TYPE_MAP['INPUT']
+        
+        # Build Edge List (Source -> Dest)
+        for out, _, inputs in self.parser.gates:
+            if out in self.name_to_idx:
+                dst = self.name_to_idx[out]
+                for inp in inputs:
+                    if inp in self.name_to_idx:
+                        src = self.name_to_idx[inp]
+                        self.edges_list.append([src, dst])
+        
+        # Create Edge Index Tensor
+        if self.edges_list:
+            self.edge_index = torch.tensor(self.edges_list, dtype=torch.long, device=device).t().contiguous()
+        else:
+            self.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+            
+        # Create Boolean Masks for Vectorized Logic
+        self.masks = {}
+        for t_name, t_id in self.TYPE_MAP.items():
+            self.masks[t_name] = (self.node_types == t_id)
+
+        # Pre-build Python adjacency for BFS traversals (Distance calculation)
+        self.adj = [[] for _ in range(self.num_nodes)]      # Forward: src -> [dst]
+        self.parents = [[] for _ in range(self.num_nodes)]  # Backward: dst -> [src]
+        
+        for src, dst in self.edges_list:
+            self.adj[src].append(dst)
+            self.parents[dst].append(src)
+            
+        # 3. Compute Metrics Immediately
+        self.cc0, self.cc1, self.co = self._compute_scoap_vectorized()
+        self.x_base = self._build_base_features()
+
+    def _compute_scoap_vectorized(self):
+        """Vectorized SCOAP: Forward Controllability & Backward Observability"""
+        num_nodes = self.num_nodes
+        src_idx, dst_idx = self.edge_index
+        
+        # --- Part A: Controllability (Forward) ---
+        cc0 = torch.ones(num_nodes, device=self.device)
+        cc1 = torch.ones(num_nodes, device=self.device)
+        
+        mask_and = self.masks['AND'] | self.masks['NAND']
+        mask_or  = self.masks['OR'] | self.masks['NOR']
+        mask_inv = self.masks['NAND'] | self.masks['NOR'] | self.masks['NOT']
+        mask_xor = self.masks['XOR']
+        mask_buf_not = self.masks['BUFF'] | self.masks['NOT']
+        
+        for _ in range(50): 
+            cc0_prev, cc1_prev = cc0.clone(), cc1.clone()
+            
+            edge_cc0 = cc0[src_idx]
+            edge_cc1 = cc1[src_idx]
+            
+            # Aggregate per Gate (Destination)
+            min_cc0 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(
+                0, dst_idx, edge_cc0, reduce='min', include_self=False)
+            min_cc1 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(
+                0, dst_idx, edge_cc1, reduce='min', include_self=False)
+            
+            sum_cc0 = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, edge_cc0)
+            sum_cc1 = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, edge_cc1)
+            
+            # Apply Logic
+            cc0[mask_and] = min_cc0[mask_and] + 1
+            cc1[mask_and] = sum_cc1[mask_and] + 1
+            
+            cc0[mask_or] = sum_cc0[mask_or] + 1
+            cc1[mask_or] = min_cc1[mask_or] + 1
+            
+            cc0[mask_buf_not] = min_cc0[mask_buf_not] + 1
+            cc1[mask_buf_not] = min_cc1[mask_buf_not] + 1
+            
+            cc0[mask_xor] = torch.minimum(sum_cc0[mask_xor], sum_cc1[mask_xor]) + 1
+            cc1[mask_xor] = torch.maximum(min_cc0[mask_xor], min_cc1[mask_xor]) + 1
+
+            # Inversions
+            temp_cc0 = cc0.clone()
+            cc0[mask_inv] = cc1[mask_inv]
+            cc1[mask_inv] = temp_cc0[mask_inv]
+            
+            # Reset Inputs
+            mask_input = self.masks['INPUT']
+            cc0[mask_input] = 1.0
+            cc1[mask_input] = 1.0
+            
+            if torch.allclose(cc0, cc0_prev) and torch.allclose(cc1, cc1_prev):
+                break
+
+        # --- Part B: Observability (Backward) ---
+        co = torch.full((num_nodes,), 1e6, device=self.device)
+        
+        output_indices = [self.name_to_idx[n] for n in self.parser.all_outputs if n in self.name_to_idx]
+        if output_indices:
+            co[torch.tensor(output_indices, device=self.device)] = 0.0
+
+        gate_cc0_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, cc0[src_idx])
+        gate_cc1_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, cc1[src_idx])
+        gate_min_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(
+            0, dst_idx, torch.minimum(cc0[src_idx], cc1[src_idx]))
+
+        for _ in range(50):
+            co_prev = co.clone()
+            
+            co_dst = co[dst_idx]
+            dst_types = self.node_types[dst_idx]
+            side_costs = torch.zeros_like(co_dst)
+            
+            # Side input logic
+            is_and = (dst_types == self.TYPE_MAP['AND']) | (dst_types == self.TYPE_MAP['NAND'])
+            side_costs[is_and] = gate_cc1_sum[dst_idx][is_and] - cc1[src_idx][is_and]
+            
+            is_or = (dst_types == self.TYPE_MAP['OR']) | (dst_types == self.TYPE_MAP['NOR'])
+            side_costs[is_or] = gate_cc0_sum[dst_idx][is_or] - cc0[src_idx][is_or]
+            
+            is_xor = (dst_types == self.TYPE_MAP['XOR'])
+            side_costs[is_xor] = gate_min_sum[dst_idx][is_xor] - torch.minimum(cc0[src_idx], cc1[src_idx])[is_xor]
+            
+            path_costs = co_dst + side_costs + 1
+            
+            new_co = torch.zeros_like(co).scatter_reduce_(
+                0, src_idx, path_costs, reduce='min', include_self=False
+            )
+            
+            co = torch.minimum(co, new_co)
+            
+            if torch.allclose(co, co_prev):
+                break
+                
+        return cc0, cc1, co
+
+    def _compute_depth_fast(self, reverse=False):
+        """Vectorized Topological Depth"""
+        d_vals = torch.zeros(self.num_nodes, device=self.device)
+        src_idx, dst_idx = self.edge_index
+        prop_src = dst_idx if reverse else src_idx
+        prop_dst = src_idx if reverse else dst_idx
+        
+        for _ in range(50):
+            changed = False
+            src_depths = d_vals[prop_src]
+            new_depths = torch.zeros(self.num_nodes, device=self.device).scatter_reduce_(
+                0, prop_dst, src_depths, reduce='amax', include_self=True
+            )
+            new_depths = new_depths + 1
+            if not torch.allclose(d_vals, new_depths):
+                d_vals = new_depths
+                changed = True
+            if not changed: break
+            
+        max_d = d_vals.max() if d_vals.max() > 0 else 1.0
+        return (d_vals / max_d).unsqueeze(1)
+
+    def _build_base_features(self):
+        """
+        Builds 16-dimensional feature matrix
+        [0-7]: Type, [8-9]: Depth, [10-11]: Fault, [12-14]: SCOAP, [15]: Output
+        """
+        x_type = torch.nn.functional.one_hot(self.node_types, num_classes=8).float()
+        fwd_depth = self._compute_depth_fast(reverse=False)
+        rev_depth = self._compute_depth_fast(reverse=True)
+        
+        f_cc0 = torch.log(self.cc0 + 1).unsqueeze(1) / 10.0
+        f_cc1 = torch.log(self.cc1 + 1).unsqueeze(1) / 10.0
+        f_co  = torch.log(self.co + 1).unsqueeze(1) / 10.0
+        
+        is_output = torch.zeros((self.num_nodes, 1), device=self.device)
+        for name in self.parser.all_outputs:
+            if name in self.name_to_idx:
+                is_output[self.name_to_idx[name]] = 1.0
+                
+        zeros = torch.zeros((self.num_nodes, 2), device=self.device)
+        
+        return torch.cat([x_type, fwd_depth, rev_depth, zeros, f_cc0, f_cc1, f_co, is_output], dim=1)
+
+    def get_data_for_fault(self, fault_name):
+        """Generate Data object for a specific fault"""
+        x = self.x_base.clone()
+        tid = self.name_to_idx.get(fault_name)
+        
+        if tid is not None:
+            x[tid, 10] = 1.0 # Mark target
+            
+            # BFS for Distance (Index 11)
+            dist = torch.full((self.num_nodes,), -1.0, device=self.device)
+            dist[tid] = 0.0
+            queue = [tid]
+            visited = {tid: 0}
+            idx = 0
+            
+            while idx < len(queue):
+                u = queue[idx]
+                idx += 1
+                d = visited[u]
+                if d >= 10: continue
+                
+                neighbors = self.adj[u] + self.parents[u]
+                for v in neighbors:
+                    if v not in visited:
+                        visited[v] = d + 1
+                        dist[v] = d + 1
+                        queue.append(v)
+            
+            mask_visited = (dist != -1)
+            if mask_visited.any():
+                max_d = dist.max()
+                if max_d == 0: max_d = 1.0
+                x[mask_visited, 11] = 1.0 - (dist[mask_visited] / max_d)
+                
+        return Data(x=x, edge_index=self.edge_index, node_names=self.ordered_names)
