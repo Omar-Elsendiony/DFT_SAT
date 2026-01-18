@@ -30,17 +30,20 @@ class VectorizedGraphExtractor:
         self.name_to_idx = {name: i for i, name in enumerate(self.ordered_names)}
         self.num_nodes = len(self.ordered_names)
         
-        # Structure
+        # Build structural tensors
         self.edges_list = []
         self.node_types = torch.zeros(self.num_nodes, dtype=torch.long, device=device)
         
         for name, g_type, _ in self.parser.gates:
             if name in self.name_to_idx:
                 self.node_types[self.name_to_idx[name]] = self.TYPE_MAP.get(g_type, 1)
+        
         for pi in self.parser.inputs:
-            if pi in self.name_to_idx: self.node_types[self.name_to_idx[pi]] = self.TYPE_MAP['INPUT']
+            if pi in self.name_to_idx: 
+                self.node_types[self.name_to_idx[pi]] = self.TYPE_MAP['INPUT']
         for ppi in self.parser.ppis:
-            if ppi in self.name_to_idx: self.node_types[self.name_to_idx[ppi]] = self.TYPE_MAP['INPUT']
+            if ppi in self.name_to_idx: 
+                self.node_types[self.name_to_idx[ppi]] = self.TYPE_MAP['INPUT']
         
         for out, _, inputs in self.parser.gates:
             if out in self.name_to_idx:
@@ -69,6 +72,7 @@ class VectorizedGraphExtractor:
         self.x_base = self._build_base_features()
 
     def _compute_scoap_vectorized(self):
+        """Vectorized SCOAP: Forward Controllability & Backward Observability"""
         num_nodes = self.num_nodes
         src_idx, dst_idx = self.edge_index
         
@@ -83,30 +87,45 @@ class VectorizedGraphExtractor:
         
         for _ in range(50): 
             cc0_prev, cc1_prev = cc0.clone(), cc1.clone()
-            edge_cc0 = cc0[src_idx]; edge_cc1 = cc1[src_idx]
-            min_cc0 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(0, dst_idx, edge_cc0, reduce='min', include_self=False)
-            min_cc1 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(0, dst_idx, edge_cc1, reduce='min', include_self=False)
+            edge_cc0 = cc0[src_idx]
+            edge_cc1 = cc1[src_idx]
+            
+            min_cc0 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(
+                0, dst_idx, edge_cc0, reduce='min', include_self=False)
+            min_cc1 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(
+                0, dst_idx, edge_cc1, reduce='min', include_self=False)
             sum_cc0 = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, edge_cc0)
             sum_cc1 = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, edge_cc1)
             
-            cc0[mask_and] = min_cc0[mask_and] + 1; cc1[mask_and] = sum_cc1[mask_and] + 1
-            cc0[mask_or] = sum_cc0[mask_or] + 1; cc1[mask_or] = min_cc1[mask_or] + 1
-            cc0[mask_buf_not] = min_cc0[mask_buf_not] + 1; cc1[mask_buf_not] = min_cc1[mask_buf_not] + 1
+            cc0[mask_and] = min_cc0[mask_and] + 1
+            cc1[mask_and] = sum_cc1[mask_and] + 1
+            cc0[mask_or] = sum_cc0[mask_or] + 1
+            cc1[mask_or] = min_cc1[mask_or] + 1
+            cc0[mask_buf_not] = min_cc0[mask_buf_not] + 1
+            cc1[mask_buf_not] = min_cc1[mask_buf_not] + 1
             cc0[mask_xor] = torch.minimum(sum_cc0[mask_xor], sum_cc1[mask_xor]) + 1
             cc1[mask_xor] = torch.maximum(min_cc0[mask_xor], min_cc1[mask_xor]) + 1
             
             temp_cc0 = cc0.clone()
-            cc0[mask_inv] = cc1[mask_inv]; cc1[mask_inv] = temp_cc0[mask_inv]
-            mask_input = self.masks['INPUT']; cc0[mask_input] = 1.0; cc1[mask_input] = 1.0
-            if torch.allclose(cc0, cc0_prev) and torch.allclose(cc1, cc1_prev): break
+            cc0[mask_inv] = cc1[mask_inv]
+            cc1[mask_inv] = temp_cc0[mask_inv]
+            
+            mask_input = self.masks['INPUT']
+            cc0[mask_input] = 1.0
+            cc1[mask_input] = 1.0
+            
+            if torch.allclose(cc0, cc0_prev) and torch.allclose(cc1, cc1_prev):
+                break
 
         co = torch.full((num_nodes,), 1e6, device=self.device)
         output_indices = [self.name_to_idx[n] for n in self.parser.all_outputs if n in self.name_to_idx]
-        if output_indices: co[torch.tensor(output_indices, device=self.device)] = 0.0
+        if output_indices:
+            co[torch.tensor(output_indices, device=self.device)] = 0.0
         
         gate_cc0_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, cc0[src_idx])
         gate_cc1_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, cc1[src_idx])
-        gate_min_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, torch.minimum(cc0[src_idx], cc1[src_idx]))
+        gate_min_sum = torch.zeros(num_nodes, device=self.device).scatter_add_(
+            0, dst_idx, torch.minimum(cc0[src_idx], cc1[src_idx]))
 
         for _ in range(50):
             co_prev = co.clone()
@@ -122,13 +141,16 @@ class VectorizedGraphExtractor:
             side_costs[is_xor] = gate_min_sum[dst_idx][is_xor] - torch.minimum(cc0[src_idx], cc1[src_idx])[is_xor]
             
             path_costs = co_dst + side_costs + 1
-            new_co = torch.zeros_like(co).scatter_reduce_(0, src_idx, path_costs, reduce='min', include_self=False)
+            new_co = torch.zeros_like(co).scatter_reduce_(
+                0, src_idx, path_costs, reduce='min', include_self=False)
             co = torch.minimum(co, new_co)
-            if torch.allclose(co, co_prev): break
-            
+            if torch.allclose(co, co_prev):
+                break
+        
         return cc0, cc1, co
 
     def _compute_depth_fast(self, reverse=False):
+        """Vectorized Topological Depth"""
         d_vals = torch.zeros(self.num_nodes, device=self.device)
         src_idx, dst_idx = self.edge_index
         prop_src = dst_idx if reverse else src_idx
@@ -140,13 +162,17 @@ class VectorizedGraphExtractor:
             new_depths = torch.zeros(self.num_nodes, device=self.device).scatter_reduce_(
                 0, prop_dst, src_depths, reduce='amax', include_self=True)
             new_depths = new_depths + 1
-            if not torch.allclose(d_vals, new_depths): d_vals = new_depths; changed = True
-            if not changed: break
+            if not torch.allclose(d_vals, new_depths):
+                d_vals = new_depths
+                changed = True
+            if not changed: 
+                break
+        
         max_d = d_vals.max() if d_vals.max() > 0 else 1.0
         return (d_vals / max_d).unsqueeze(1)
 
     def _build_base_features(self):
-        """Builds 16 Base Features"""
+        """Builds 16 Base Features (without target value)"""
         x_type = torch.nn.functional.one_hot(self.node_types, num_classes=8).float()
         fwd_depth = self._compute_depth_fast(reverse=False)
         rev_depth = self._compute_depth_fast(reverse=True)
@@ -157,7 +183,8 @@ class VectorizedGraphExtractor:
         
         is_output = torch.zeros((self.num_nodes, 1), device=self.device)
         for name in self.parser.all_outputs:
-            if name in self.name_to_idx: is_output[self.name_to_idx[name]] = 1.0
+            if name in self.name_to_idx: 
+                is_output[self.name_to_idx[name]] = 1.0
         
         zeros = torch.zeros((self.num_nodes, 2), device=self.device)
         
@@ -175,25 +202,35 @@ class VectorizedGraphExtractor:
         target_feat = torch.full((self.num_nodes, 1), 0.5, device=self.device)
         
         if tid is not None:
-            x[tid, 10] = 1.0 # Fault Location
-            target_feat[tid] = 0.0 if fault_type == 1 else 1.0 # Target Value
+            x[tid, 10] = 1.0  # Fault location marker
+            target_feat[tid] = 0.0 if fault_type == 1 else 1.0
             
             # BFS Distance
             dist = torch.full((self.num_nodes,), -1.0, device=self.device)
             dist[tid] = 0.0
-            queue = [tid]; visited = {tid: 0}; idx = 0
+            queue = [tid]
+            visited = {tid: 0}
+            idx = 0
+            
             while idx < len(queue):
-                u = queue[idx]; idx += 1
+                u = queue[idx]
+                idx += 1
                 d = visited[u]
-                if d >= 10: continue
+                if d >= 10: 
+                    continue
+                
                 neighbors = self.adj[u] + self.parents[u]
                 for v in neighbors:
-                    if v not in visited: visited[v] = d + 1; dist[v] = d + 1; queue.append(v)
+                    if v not in visited:
+                        visited[v] = d + 1
+                        dist[v] = d + 1
+                        queue.append(v)
             
             mask_visited = (dist != -1)
             if mask_visited.any():
                 max_d = dist.max()
-                if max_d == 0: max_d = 1.0
+                if max_d == 0: 
+                    max_d = 1.0
                 x[mask_visited, 11] = 1.0 - (dist[mask_visited] / max_d)
         
         x = torch.cat([x, target_feat], dim=1)
