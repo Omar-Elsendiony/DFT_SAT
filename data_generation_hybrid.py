@@ -266,7 +266,7 @@ def get_target_files(DIR):
     file_list = []
     for root, dirs, files in os.walk(DIR):
         for f in files:
-            if f.endswith(".bench"):
+            if f.endswith(".bench") or f.endswith(".v"):
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, DIR)
                 file_list.append(rel_path)
