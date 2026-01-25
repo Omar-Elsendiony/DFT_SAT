@@ -2,14 +2,26 @@ import os
 import random
 from collections import deque
 from pysat.solvers import Glucose3, Minisat22
-from BenchParser import BenchParser
+
+# Support both formats
+try:
+    from UnifiedParser import UnifiedParser as Parser
+except ImportError:
+    from BenchParser import BenchParser as Parser
 
 class WireFaultMiter:
-    def __init__(self, bench_file):
-        self.bench_file = bench_file
-        self.parser = BenchParser(bench_file)
-        self.inputs = self.parser.all_inputs      
-        self.outputs = self.parser.all_outputs    
+    def __init__(self, circuit_file):
+        """
+        Initialize miter for fault detection.
+        
+        Args:
+            circuit_file: Path to .bench or .v file (auto-detected)
+        """
+        self.circuit_file = circuit_file
+        self.parser = Parser(circuit_file)  # Auto-detects format!
+        
+        self.inputs = self.parser.all_inputs
+        self.outputs = self.parser.all_outputs
         self.gates = self.parser.gates
         self.var_map = self.parser.build_var_map()
         self.next_var = len(self.var_map) + 1
@@ -92,6 +104,7 @@ class WireFaultMiter:
         return clauses
 
     def _add_gate_clauses(self, clauses, out, g_type, inputs):
+        """Add CNF clauses for a gate."""
         if g_type == 'AND':
             for i in inputs: 
                 clauses.append([-out, i])
@@ -118,6 +131,41 @@ class WireFaultMiter:
                 clauses.append([-out, a, b])
                 clauses.append([out, -a, b])
                 clauses.append([out, a, -b])
+            else:
+                # Multi-input XOR (cascade pairwise)
+                prev = inputs[0]
+                for inp in inputs[1:-1]:
+                    temp = self.next_var
+                    self.next_var += 1
+                    # temp = prev XOR inp
+                    clauses.extend([
+                        [-temp, -prev, -inp],
+                        [-temp, prev, inp],
+                        [temp, -prev, inp],
+                        [temp, prev, -inp]
+                    ])
+                    prev = temp
+                # Final XOR
+                a, b = prev, inputs[-1]
+                clauses.extend([
+                    [-out, -a, -b],
+                    [-out, a, b],
+                    [out, -a, b],
+                    [out, a, -b]
+                ])
+        elif g_type == 'XNOR':
+            # XNOR = NOT(XOR)
+            if len(inputs) == 2:
+                a, b = inputs
+                clauses.append([out, -a, -b])
+                clauses.append([out, a, b])
+                clauses.append([-out, -a, b])
+                clauses.append([-out, a, -b])
         elif g_type == 'BUFF':
-             clauses.append([-out, inputs[0]])
-             clauses.append([out, -inputs[0]])
+            clauses.append([-out, inputs[0]])
+            clauses.append([out, -inputs[0]])
+        else:
+            # Unknown gate type - treat as buffer
+            if len(inputs) > 0:
+                clauses.append([-out, inputs[0]])
+                clauses.append([out, -inputs[0]])

@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+Recursive Verilog Flattener
+
+Recursively processes a directory tree of Verilog files, flattens them using Yosys,
+and recreates the same directory structure in the output folder.
+
+Usage:
+    python recursive_verilog_flattener.py <input_dir> <output_dir> [method]
+    
+Example:
+    python recursive_verilog_flattener.py ./raw_verilog ./flat_verilog yosys
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+from pathlib import Path
+from tqdm import tqdm
+import multiprocessing as mp
+
+# =============================================================================
+# FLATTENING METHODS
+# =============================================================================
+
+def flatten_with_yosys(input_file, output_file):
+    """
+    Flatten Verilog using Yosys.
+    Returns True if successful, False otherwise.
+    """
+    # Create Yosys script
+    script = f"""
+# Read Verilog
+read_verilog {input_file}
+
+# Try to find top module automatically
+hierarchy -check -auto-top
+
+# Flatten hierarchy
+flatten
+
+# Synthesize to gates
+synth -flatten
+
+# Map to simple gates
+techmap
+
+# Clean up
+opt_clean
+
+# Write gate-level Verilog
+write_verilog -noattr -noexpr {output_file}
+"""
+    
+    script_file = output_file + ".ys"
+    
+    try:
+        # Write script
+        with open(script_file, 'w') as f:
+            f.write(script)
+        
+        # Run Yosys
+        result = subprocess.run(
+            ['yosys', '-s', script_file],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        
+        # Check if successful
+        if result.returncode == 0 and os.path.exists(output_file):
+            # Clean up script file
+            os.remove(script_file)
+            return True
+        else:
+            print(f"  ⚠️  Yosys failed: {result.stderr[:200]}")
+            if os.path.exists(script_file):
+                os.remove(script_file)
+            return False
+            
+    except FileNotFoundError:
+        print("  ❌ Yosys not found! Install: sudo apt-get install yosys")
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"  ⏱️  Timeout (circuit too complex)")
+        if os.path.exists(script_file):
+            os.remove(script_file)
+        return False
+    except Exception as e:
+        print(f"  ❌ Error: {e}")
+        if os.path.exists(script_file):
+            os.remove(script_file)
+        return False
+
+
+def flatten_with_manual(input_file, output_file):
+    """
+    Manual preprocessing (fallback if Yosys unavailable).
+    """
+    import re
+    
+    try:
+        with open(input_file, 'r') as f:
+            content = f.read()
+        
+        # Remove comments
+        content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
+        content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+        
+        # Expand assign statements to gates
+        def replace_assign(match):
+            lhs = match.group(1).strip()
+            rhs = match.group(2).strip()
+            
+            if rhs.startswith('~'):
+                inp = rhs[1:].strip()
+                return f"  not g_not_{lhs} ({lhs}, {inp});"
+            elif '&' in rhs:
+                inputs = [x.strip() for x in rhs.split('&')]
+                return f"  and g_and_{lhs} ({lhs}, {', '.join(inputs)});"
+            elif '|' in rhs:
+                inputs = [x.strip() for x in rhs.split('|')]
+                return f"  or g_or_{lhs} ({lhs}, {', '.join(inputs)});"
+            elif '^' in rhs:
+                inputs = [x.strip() for x in rhs.split('^')]
+                return f"  xor g_xor_{lhs} ({lhs}, {', '.join(inputs)});"
+            else:
+                return f"  buf g_buf_{lhs} ({lhs}, {rhs});"
+        
+        pattern = r'assign\s+(\w+)\s*=\s*([^;]+);'
+        content = re.sub(pattern, replace_assign, content)
+        
+        # Expand always blocks to DFFs
+        def replace_always(match):
+            block = match.group(1)
+            assignments = re.findall(r'(\w+)\s*<=\s*([^;]+);', block)
+            dffs = [f"  dff dff_{q} ({q}, {d}, clk);" for q, d in assignments]
+            return '\n'.join(dffs)
+        
+        pattern = r'always\s*@\s*\([^)]+\)\s*begin(.*?)end'
+        content = re.sub(pattern, replace_always, content, flags=re.DOTALL)
+        
+        # Write output
+        with open(output_file, 'w') as f:
+            f.write(content)
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Manual preprocessing failed: {e}")
+        return False
+
+
+# =============================================================================
+# FILE DISCOVERY
+# =============================================================================
+
+def find_verilog_files(root_dir):
+    """
+    Recursively find all Verilog files in directory tree.
+    Returns list of (relative_path, absolute_input_path) tuples.
+    """
+    verilog_files = []
+    root_path = Path(root_dir).resolve()
+
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        for filename in filenames:
+            if filename.endswith(('.v', '.verilog', '.sv')):
+                abs_path = (Path(dirpath) / filename).resolve()
+                rel_path = abs_path.relative_to(root_path)
+                verilog_files.append((str(rel_path), str(abs_path)))
+
+    return sorted(verilog_files)
+
+
+# =============================================================================
+# PARALLEL PROCESSING
+# =============================================================================
+
+def process_single_file(args):
+    """
+    Worker function for parallel processing.
+    Args: (rel_path, input_path, output_dir, method)
+    """
+    rel_path, input_path, output_dir, method = args
+    
+    # Create output path (same relative structure)
+    output_path = Path(output_dir) / rel_path
+    
+    # Create parent directory if needed
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Convert to string
+    output_path = str(output_path)
+    
+    # Choose flattening method
+    if method == 'yosys':
+        success = flatten_with_yosys(input_path, output_path)
+    elif method == 'manual':
+        success = flatten_with_manual(input_path, output_path)
+    elif method == 'copy':
+        # Just copy without flattening
+        shutil.copy2(input_path, output_path)
+        success = True
+    else:
+        print(f"Unknown method: {method}")
+        success = False
+    
+    return (rel_path, success)
+
+
+# =============================================================================
+# MAIN PROCESSING
+# =============================================================================
+
+def flatten_directory_tree(input_dir, output_dir, method='yosys', num_workers=None):
+    """
+    Main function to recursively flatten Verilog files.
+    
+    Args:
+        input_dir: Root directory with Verilog files
+        output_dir: Root directory for flattened output
+        method: 'yosys', 'manual', or 'copy'
+        num_workers: Number of parallel workers (None = auto)
+    """
+    
+    print("=" * 80)
+    print("RECURSIVE VERILOG FLATTENER")
+    print("=" * 80)
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Method: {method}")
+    print("=" * 80)
+    
+    # Find all Verilog files
+    print("\n🔍 Scanning directory tree...")
+    verilog_files = find_verilog_files(input_dir)
+    
+    if not verilog_files:
+        print(f"❌ No Verilog files found in {input_dir}")
+        return
+    
+    print(f"✅ Found {len(verilog_files)} Verilog files\n")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Determine number of workers
+    if num_workers is None:
+        num_workers = min(os.cpu_count(), 8)
+    
+    print(f"🚀 Processing with {num_workers} parallel workers...\n")
+    
+    # Prepare arguments for parallel processing
+    tasks = [(rel_path, abs_path, output_dir, method) 
+             for rel_path, abs_path in verilog_files]
+    
+    # Process in parallel
+    results = []
+    successful = 0
+    failed = 0
+    
+    try:
+        mp.set_start_method('spawn', force=True)
+    except:
+        pass
+    
+    with mp.Pool(processes=num_workers) as pool:
+        for rel_path, success in tqdm(
+            pool.imap_unordered(process_single_file, tasks),
+            total=len(tasks),
+            desc="Flattening files"
+        ):
+            if success:
+                successful += 1
+            else:
+                failed += 1
+                print(f"  ❌ Failed: {rel_path}")
+    
+    # Summary
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    print(f"Total files:      {len(verilog_files)}")
+    print(f"✅ Successful:    {successful}")
+    print(f"❌ Failed:        {failed}")
+    print(f"Success rate:     {successful/len(verilog_files)*100:.1f}%")
+    print("=" * 80)
+    
+    if failed > 0:
+        print("\n⚠️  Some files failed. Try:")
+        print("  1. Check Yosys installation: yosys --version")
+        print("  2. Try manual method: --method manual")
+        print("  3. Check Verilog syntax")
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def compare_directory_structures(input_dir, output_dir):
+    """
+    Compare directory structures to verify hierarchy is preserved.
+    """
+    input_files = set(f[0] for f in find_verilog_files(input_dir))
+    output_files = set(f[0] for f in find_verilog_files(output_dir))
+    
+    print("\n📊 Directory Structure Comparison:")
+    print(f"Input files:  {len(input_files)}")
+    print(f"Output files: {len(output_files)}")
+    
+    missing = input_files - output_files
+    if missing:
+        print(f"\n⚠️  Missing files in output: {len(missing)}")
+        for f in sorted(missing)[:5]:
+            print(f"  - {f}")
+        if len(missing) > 5:
+            print(f"  ... and {len(missing) - 5} more")
+    else:
+        print("✅ All files present in output")
+
+
+def show_tree_preview(directory, max_depth=3):
+    """Show a preview of the directory tree."""
+    print(f"\n📁 Directory tree preview ({directory}):")
+    
+    def print_tree(path, prefix="", depth=0):
+        if depth > max_depth:
+            return
+        
+        items = sorted(os.listdir(path))
+        dirs = [i for i in items if os.path.isdir(os.path.join(path, i))]
+        files = [i for i in items if i.endswith(('.v', '.verilog', '.sv'))]
+        
+        for i, d in enumerate(dirs[:3]):  # Show first 3 dirs
+            is_last = (i == len(dirs) - 1) and not files
+            print(f"{prefix}{'└── ' if is_last else '├── '}{d}/")
+            new_prefix = prefix + ("    " if is_last else "│   ")
+            print_tree(os.path.join(path, d), new_prefix, depth + 1)
+        
+        if len(dirs) > 3:
+            print(f"{prefix}... and {len(dirs) - 3} more directories")
+        
+        for i, f in enumerate(files[:3]):  # Show first 3 files
+            is_last = i == len(files) - 1
+            print(f"{prefix}{'└── ' if is_last else '├── '}{f}")
+        
+        if len(files) > 3:
+            print(f"{prefix}... and {len(files) - 3} more files")
+    
+    print_tree(directory)
+
+
+# =============================================================================
+# COMMAND LINE INTERFACE
+# =============================================================================
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Recursively flatten Verilog files while preserving directory structure",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Flatten using Yosys (recommended)
+  python recursive_verilog_flattener.py ./raw_verilog ./flat_verilog
+  
+  # Use manual preprocessing (no Yosys required)
+  python recursive_verilog_flattener.py ./raw_verilog ./flat_verilog --method manual
+  
+  # Just copy files (no flattening)
+  python recursive_verilog_flattener.py ./raw_verilog ./flat_verilog --method copy
+  
+  # Use more workers
+  python recursive_verilog_flattener.py ./raw_verilog ./flat_verilog --workers 16
+  
+  # Preview directory tree
+  python recursive_verilog_flattener.py ./raw_verilog ./flat_verilog --preview
+        """
+    )
+    
+    parser.add_argument('input_dir', help='Input directory with Verilog files')
+    parser.add_argument('output_dir', help='Output directory for flattened files')
+    parser.add_argument('--method', choices=['yosys', 'manual', 'copy'], 
+                       default='yosys', help='Flattening method (default: yosys)')
+    parser.add_argument('--workers', type=int, default=None,
+                       help='Number of parallel workers (default: auto)')
+    parser.add_argument('--preview', action='store_true',
+                       help='Preview directory tree before processing')
+    parser.add_argument('--compare', action='store_true',
+                       help='Compare input/output structures after processing')
+    
+    args = parser.parse_args()
+    
+    # Validate input directory
+    if not os.path.isdir(args.input_dir):
+        print(f"❌ Error: Input directory does not exist: {args.input_dir}")
+        sys.exit(1)
+    
+    # Preview if requested
+    if args.preview:
+        show_tree_preview(args.input_dir)
+        response = input("\nProceed with flattening? [y/N]: ")
+        if response.lower() != 'y':
+            print("Cancelled.")
+            sys.exit(0)
+    
+    # Process files
+    flatten_directory_tree(
+        args.input_dir,
+        args.output_dir,
+        method=args.method,
+        num_workers=args.workers
+    )
+    
+    # Compare if requested
+    if args.compare:
+        compare_directory_structures(args.input_dir, args.output_dir)
+    
+    # Show output tree
+    if os.path.isdir(args.output_dir):
+        show_tree_preview(args.output_dir)
+
+
+if __name__ == "__main__":
+    main()

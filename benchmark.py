@@ -11,7 +11,7 @@ import csv
 import random
 import numpy as np
 import torch
-from pysat.solvers import Minisat22, Glucose3
+from pysat.solvers import Minisat22, Glucose3, Cadical195, Glucose42, Gluecard4
 from WireFaultMiter import WireFaultMiter
 from neuro_utils import VectorizedGraphExtractor
 
