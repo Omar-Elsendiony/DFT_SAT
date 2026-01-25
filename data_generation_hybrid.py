@@ -21,7 +21,7 @@ from neuro_utils import VectorizedGraphExtractor
 # =============================================================================
 # CONFIGS
 # =============================================================================
-GENERATE_TRAIN_DATA_DIR = "../I99T"
+GENERATE_TRAIN_DATA_DIR = "../output"
 DATASET_PATH = "dataset_hybrid_17feat.pt"
 SAMPLES_PER_FILE = 20
 MAX_PROBES = 5  # Only probe top-5 inputs
@@ -288,7 +288,7 @@ def generate_dataset():
     files = get_target_files(GENERATE_TRAIN_DATA_DIR)
     
     if not files:
-        print(f"ERROR: No .bench files found in {GENERATE_TRAIN_DATA_DIR}")
+        print(f"ERROR: No .bench or .v files found in {GENERATE_TRAIN_DATA_DIR}")
         return
     
     print(f"Found {len(files)} benchmark files")
