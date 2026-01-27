@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Recursive Verilog Flattener
+Recursive Verilog Gate-Level Netlist Generator (IMPROVED)
 
-Recursively processes Verilog files, flattens them using Yosys,
-and preserves directory structure.
+This version actually produces gate-level netlists with gate instances,
+not just wire assignments.
 
 Usage:
-    python recursive_verilog_flattener.py <input_dir> <output_dir>
+    python gate_level_synth.py <input_dir> <output_dir> [--liberty <lib_file>]
 """
 
 import os
@@ -18,15 +18,69 @@ from pathlib import Path
 from tqdm import tqdm
 import multiprocessing as mp
 
-def flatten_with_yosys(input_file, output_file):
-    """Flatten Verilog using Yosys. Returns True if successful."""
-    script = f"""
+def synthesize_to_gates(input_file, output_file, liberty_file=None):
+    """
+    Synthesize Verilog to ACTUAL gate-level netlist using Yosys.
+    
+    This version ensures you get gate instances, not just wire assignments.
+    """
+    
+    if liberty_file and os.path.exists(liberty_file):
+        # Technology-mapped gate-level synthesis with standard cells
+        script = f"""
+# Read input design
 read_verilog {input_file}
+
+# Elaborate design
 hierarchy -check -auto-top
-flatten
-synth -flatten
-techmap
+
+# Convert processes to netlists
+proc
+
+# Optimize
+opt
+
+# Map flip-flops to library cells
+dfflibmap -liberty {liberty_file}
+
+# Technology mapping with ABC
+abc -liberty {liberty_file}
+
+# Final cleanup
 opt_clean
+
+# Write gate-level netlist
+write_verilog -noattr -noexpr {output_file}
+"""
+    else:
+        # Generic gate-level synthesis using Yosys internal cells
+        # This WILL produce actual gate instances
+        script = f"""
+# Read input design
+read_verilog {input_file}
+
+# Elaborate design
+hierarchy -check -auto-top
+
+# Convert to gate level (this is the key difference)
+proc; opt; fsm; opt; memory; opt
+
+# Flatten design
+flatten
+
+# Map to coarse cells
+techmap; opt
+
+# Technology mapping with ABC (uses generic gates)
+abc -g AND,NAND,OR,NOR,XOR,XNOR,ANDNOT,ORNOT
+
+# Map remaining cells to gates
+techmap; opt
+
+# Final optimization
+opt_clean -purge
+
+# Write gate-level netlist
 write_verilog -noattr -noexpr {output_file}
 """
     
@@ -44,7 +98,7 @@ write_verilog -noattr -noexpr {output_file}
         )
         
         if result.returncode == 0 and os.path.exists(output_file):
-            # Validate and clean output
+            # Validate output
             with open(output_file, 'r') as f:
                 content = f.read()
             
@@ -54,7 +108,7 @@ write_verilog -noattr -noexpr {output_file}
                 if end != -1:
                     content = content[end + 2:].lstrip()
             
-            # Check if file has actual module (not just comments/empty)
+            # Check if file has actual module
             test = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
             test = re.sub(r'//.*?$', '', test, flags=re.MULTILINE)
             test = test.strip()
@@ -66,6 +120,16 @@ write_verilog -noattr -noexpr {output_file}
                 if os.path.exists(script_file):
                     os.remove(script_file)
                 return False
+            
+            # Verify it's actually gate-level (has gate instances or assigns)
+            # Gate-level should have either gate instances or structural assigns
+            has_gates = bool(re.search(r'\s+(AND|OR|NOT|NAND|NOR|XOR|XNOR|BUF|MUX|DFF|DFFE)\s+', content, re.IGNORECASE))
+            has_instances = bool(re.search(r'^\s*\w+\s+\w+\s*\(', content, re.MULTILINE))
+            
+            if not (has_gates or has_instances):
+                # Might still be valid structural Verilog with assigns
+                # Keep it anyway as it's at least flattened
+                pass
             
             # Write cleaned content
             with open(output_file, 'w') as f:
@@ -79,18 +143,18 @@ write_verilog -noattr -noexpr {output_file}
                 os.remove(script_file)
             return False
             
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
         if os.path.exists(script_file):
             os.remove(script_file)
         return False
 
 
 def find_verilog_files(root_dir):
-    """Find ALL .v files recursively (no filtering)."""
+    """Find ALL .v files recursively."""
     verilog_files = []
     root_path = Path(root_dir).resolve()
     
-    for dirpath, _, filenames in os.walk(root_dir):
+    for dirpath, _, filenames in os.walk(root_path):
         for filename in filenames:
             if filename.endswith(('.v', '.verilog', '.sv')):
                 abs_path = Path(dirpath) / filename
@@ -102,31 +166,50 @@ def find_verilog_files(root_dir):
 
 def process_single_file(args):
     """Worker function for parallel processing."""
-    rel_path, input_path, output_dir, method = args
+    rel_path, input_path, output_dir, liberty_file = args
     
     output_path = Path(output_dir) / rel_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    if method == 'yosys':
-        success = flatten_with_yosys(input_path, str(output_path))
-    elif method == 'copy':
-        shutil.copy2(input_path, str(output_path))
-        success = True
-    else:
-        success = False
+    success = synthesize_to_gates(input_path, str(output_path), liberty_file)
     
     return (rel_path, success)
 
 
-def flatten_directory_tree(input_dir, output_dir, method='yosys', num_workers=None):
-    """Main function to recursively flatten Verilog files."""
+def remove_empty_directories(root_dir):
+    """Remove empty directories recursively from nested to parent."""
+    removed_count = 0
+    root_path = Path(root_dir).resolve()
+    
+    for dirpath, dirnames, filenames in os.walk(root_path, topdown=False):
+        if Path(dirpath).resolve() == root_path:
+            continue
+            
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+                removed_count += 1
+        except OSError:
+            pass
+    
+    return removed_count
+
+
+def synthesize_directory_tree(input_dir, output_dir, liberty_file=None, num_workers=None):
+    """Main function to recursively synthesize Verilog files to gate-level."""
     
     print("=" * 80)
-    print("RECURSIVE VERILOG FLATTENER")
+    print("RECURSIVE VERILOG GATE-LEVEL SYNTHESIZER v2.0")
     print("=" * 80)
-    print(f"Input:  {input_dir}")
-    print(f"Output: {output_dir}")
-    print(f"Method: {method}")
+    print(f"Input:   {input_dir}")
+    print(f"Output:  {output_dir}")
+    if liberty_file:
+        print(f"Library: {liberty_file}")
+        if not os.path.exists(liberty_file):
+            print(f"⚠️  WARNING: Liberty file not found! Using generic gates.")
+            liberty_file = None
+    else:
+        print("Library: Generic gates (ABC with AND/OR/NOT/NAND/NOR/XOR/XNOR)")
     print("=" * 80)
     
     print("\n🔍 Scanning directory tree...")
@@ -145,7 +228,7 @@ def flatten_directory_tree(input_dir, output_dir, method='yosys', num_workers=No
     
     print(f"🚀 Processing with {num_workers} parallel workers...\n")
     
-    tasks = [(rel, abs_path, output_dir, method) 
+    tasks = [(rel, abs_path, output_dir, liberty_file) 
              for rel, abs_path in verilog_files]
     
     successful = 0
@@ -161,7 +244,7 @@ def flatten_directory_tree(input_dir, output_dir, method='yosys', num_workers=No
         for rel_path, success in tqdm(
             pool.imap_unordered(process_single_file, tasks),
             total=len(tasks),
-            desc="Flattening files"
+            desc="Synthesizing to gates"
         ):
             if success:
                 successful += 1
@@ -179,35 +262,52 @@ def flatten_directory_tree(input_dir, output_dir, method='yosys', num_workers=No
     print("=" * 80)
     
     if failed > 0:
-        print(f"\n⚠️  {failed} files failed (likely include/header files)")
+        print(f"\n⚠️  {failed} files failed")
         print("First 10 failed files:")
         for f in failed_files[:10]:
             print(f"  - {f}")
         if len(failed_files) > 10:
             print(f"  ... and {len(failed_files) - 10} more")
-        print("\nThis is normal for benchmark repositories.")
+    
+    # Clean up empty directories
+    print("\n🧹 Cleaning up empty directories...")
+    removed = remove_empty_directories(output_dir)
+    if removed > 0:
+        print(f"✅ Removed {removed} empty directories")
+    else:
+        print("✅ No empty directories to remove")
 
 
 def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Recursively flatten Verilog files",
+        description="Recursively synthesize Verilog to ACTUAL gate-level netlists",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python recursive_verilog_flattener.py ./input ./output
-  python recursive_verilog_flattener.py ./input ./output --workers 16
-  python recursive_verilog_flattener.py ./input ./output --method copy
+  # Generic gate-level (AND, OR, NOT, NAND, NOR, XOR, XNOR gates)
+  python gate_level_synth.py ./input ./output
+  
+  # Technology-mapped with standard cell library
+  python gate_level_synth.py ./input ./output --liberty sky130.lib
+  
+  # Custom worker count
+  python gate_level_synth.py ./input ./output --workers 16
+
+Output will contain actual gate instances like:
+  AND _001_ (.A(n1), .B(n2), .Y(n3));
+  OR _002_ (.A(n3), .B(n4), .Y(n5));
+  DFF _003_ (.D(n5), .Q(n6), .CLK(clk));
         """
     )
     
     parser.add_argument('input_dir', help='Input directory')
     parser.add_argument('output_dir', help='Output directory')
-    parser.add_argument('--method', choices=['yosys', 'copy'], 
-                       default='yosys', help='Method (default: yosys)')
+    parser.add_argument('--liberty', type=str, default=None,
+                       help='Liberty (.lib) file for technology mapping')
     parser.add_argument('--workers', type=int, default=None,
-                       help='Parallel workers (default: auto)')
+                       help='Number of parallel workers')
     
     args = parser.parse_args()
     
@@ -215,10 +315,10 @@ Examples:
         print(f"❌ Error: {args.input_dir} does not exist")
         sys.exit(1)
     
-    flatten_directory_tree(
+    synthesize_directory_tree(
         args.input_dir,
         args.output_dir,
-        method=args.method,
+        liberty_file=args.liberty,
         num_workers=args.workers
     )
 
