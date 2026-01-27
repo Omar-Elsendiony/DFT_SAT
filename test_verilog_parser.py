@@ -7,12 +7,12 @@ This shows WHERE inputs and outputs are in gate instantiations
 and tests if VerilogParser handles both correctly.
 """
 
-import sys
+# import sys
 import tempfile
 import os
 
-sys.path.insert(0, '/home/claude')
-from VerilogParser_enhanced import VerilogParser
+# sys.path.insert(0, '/home/claude')
+from VerilogParser import VerilogParser
 
 print("=" * 80)
 print("UNDERSTANDING INPUT/OUTPUT POSITIONS IN GATE INSTANTIATIONS")

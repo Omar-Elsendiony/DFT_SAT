@@ -139,15 +139,20 @@ class VerilogParser:
                     self.wires.append(name)
     
     def _parse_instances(self, content):
-        """Parse gate instances (handles both standard and Yosys internal gates)."""
-        # Pattern to match gate instances
-        # Handles: gate_type instance_name (ports);
-        # Including escaped identifiers like \$_NAND_
-        instance_pattern = r'(\S+)\s+(\S+)\s*\((.*?)\)\s*;'
+        """Parse gate instances (handles both ICCAD positional and Yosys named formats)."""
+        # Pattern to match gate instances:
+        # - ICCAD: gate_type ( ports );
+        # - Yosys: \gate_type instance_name ( ports );
+        # Matches escaped identifiers starting with \ or regular identifiers
+        
+        # Identifier can be:
+        # - Escaped: \$_NAND_ or \a[0] (backslash followed by non-whitespace)
+        # - Regular: and, or, _inst123, etc. (word characters)
+        instance_pattern = r'(\\[^\s]+|\w+)\s+(?:(\\[^\s]+|\w+)\s+)?\(\s*(.*?)\s*\)\s*;'
         
         for match in re.finditer(instance_pattern, content, re.DOTALL):
             gate_type_raw = match.group(1)
-            inst_name = match.group(2)
+            inst_name = match.group(2) if match.group(2) else 'unnamed'
             port_list = match.group(3)
             
             # Normalize gate type (remove backslash, convert to lowercase)
