@@ -1,5 +1,7 @@
 """
 Benchmark GNN-Guided SAT Solving for Circuit Testability
+
+Note: Only uses POLARITY predictions (importance head removed from usage)
 """
 
 import os
@@ -11,11 +13,9 @@ import csv
 import random
 import numpy as np
 import torch
-from pysat.solvers import Minisat22, Glucose3, Cadical195, Glucose42, Gluecard4
+from pysat.solvers import Minisat22
 from WireFaultMiter import WireFaultMiter
 from neuro_utils import VectorizedGraphExtractor
-
-# Import model from training script
 from train_model import CircuitGNN_DualTask
 
 # =============================================================================
@@ -23,7 +23,7 @@ from train_model import CircuitGNN_DualTask
 # =============================================================================
 BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
 MODEL_PATH = "gnn_model_dual_task_17feat.pth"
-RESULTS_PATH = "results_gnn_guided.csv"
+RESULTS_PATH = "results_gnn_polarity.csv"
 NUM_FAULTS_PER_CIRCUIT = 10
 SEED = 42
 
@@ -60,7 +60,7 @@ def get_benchmark_files(benchmark_dir):
 def run_benchmark():
     """Main benchmarking function"""
     print("=" * 80)
-    print("GNN-GUIDED SAT SOLVING BENCHMARK")
+    print("GNN-GUIDED SAT SOLVING BENCHMARK (Polarity Only)")
     print("=" * 80)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -127,30 +127,26 @@ def run_benchmark():
                     std_conflicts = solver.accum_stats()['conflicts']
                 std_time = time.time() - t_std_start
                 
-                # === GNN-GUIDED: With hints ===
+                # === GNN-GUIDED: With polarity hints ===
                 t_gnn_start = time.time()
                 
                 # 1. Get GNN predictions
                 data = extractor.get_data_for_fault(target_gate, fault_type=fault_type).to(device)
                 
                 with torch.no_grad():
-                    imp_scores, pol_scores = model(data)
+                    _, pol_scores = model(data)  # Only use polarity
                 
-                # 2. Build phase hints (sorted by importance)
-                hints = []
+                # 2. Build phase hints (polarity only)
+                hint_literals = []
                 for idx, name in enumerate(data.node_names):
                     if name in miter.inputs:
-                        imp = imp_scores[idx].item()
                         prob = pol_scores[idx].item()
                         var_id = miter.var_map.get(name)
                         
                         if var_id:
+                            # Positive if prob > 0.5, negative otherwise
                             signed_lit = var_id if prob > 0.5 else -var_id
-                            hints.append((signed_lit, imp, var_id))
-                
-                # Sort by importance (descending), then by var_id (for determinism)
-                hints.sort(key=lambda x: (-x[1], x[2]))
-                hint_literals = [h[0] for h in hints]
+                            hint_literals.append(signed_lit)
                 
                 # 3. Solve with phase hints
                 clauses_gnn = miter.build_miter(target_gate, fault_type, 1)

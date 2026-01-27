@@ -1,17 +1,20 @@
 """
-Complete pipeline for Dual-Task GNN training with Parallel Generation & Polarity Guidance.
-Uses Cone Splitting and Branch-less Stem Optimization for Large Circuits.
+Complete Pipeline for GNN-Guided ATPG
+Uses Complete ATPG Cone Extraction (fan-in + fault + fan-out + side inputs)
+Polarity-only guidance for SAT solving
+
+Usage:
+    python pipeline_complete_fixed.py generate   # Generate dataset
+    python pipeline_complete_fixed.py train      # Train model
+    python pipeline_complete_fixed.py benchmark  # Run benchmarks
 """
 
 import os
 import sys
-
-# Add local PySAT if needed
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pysat'))
 
 import time
 import csv
-import math
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GATv2Conv
@@ -19,25 +22,19 @@ import torch.optim as optim
 import random
 import numpy as np
 from pysat.solvers import Glucose3, Minisat22
-from pysat.formula import CNF
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
-from torch_geometric.data import Dataset
-from WireFaultMiter import WireFaultMiter
-from BenchParser import BenchParser
 from torch_geometric.data import Data
 import torch.multiprocessing as mp
+from WireFaultMiter import WireFaultMiter
+from BenchParser import BenchParser
 
 # =============================================================================
-# EXTRACTOR (Defined here to ensure completeness)
+# EXTRACTOR
 # =============================================================================
 class VectorizedGraphExtractor:
-    """
-    High-Performance SCOAP Extractor using Vectorized Tensor Operations.
-    Generates 16-dimensional feature vectors including Observability.
-    """
+    """High-Performance SCOAP Extractor with 16-dimensional features"""
     
-    # Gate Type Mapping
     TYPE_MAP = {
         'INPUT': 0, 'PPI': 0, 
         'BUFF': 1, 'NOT': 2,
@@ -50,7 +47,6 @@ class VectorizedGraphExtractor:
         self.parser = BenchParser(bench_path)
         self.device = device
         
-        # 1. Build Name Mappings (Sync with Miter if var_map provided)
         if var_map:
             self.var_map = var_map
         else:
@@ -60,17 +56,14 @@ class VectorizedGraphExtractor:
         self.name_to_idx = {name: i for i, name in enumerate(self.ordered_names)}
         self.num_nodes = len(self.ordered_names)
         
-        # 2. Build Structural Tensors
         self.edges_list = []
         self.node_types = torch.zeros(self.num_nodes, dtype=torch.long, device=device)
         
-        # Assign Gate Types
         for name, g_type, _ in self.parser.gates:
             if name in self.name_to_idx:
                 idx = self.name_to_idx[name]
-                self.node_types[idx] = self.TYPE_MAP.get(g_type, 1) # Default to BUFF
+                self.node_types[idx] = self.TYPE_MAP.get(g_type, 1)
         
-        # Overwrite Types for Inputs/PPIs
         for pi in self.parser.inputs:
             if pi in self.name_to_idx:
                 self.node_types[self.name_to_idx[pi]] = self.TYPE_MAP['INPUT']
@@ -78,7 +71,6 @@ class VectorizedGraphExtractor:
             if ppi in self.name_to_idx:
                 self.node_types[self.name_to_idx[ppi]] = self.TYPE_MAP['INPUT']
         
-        # Build Edge List (Source -> Dest)
         for out, _, inputs in self.parser.gates:
             if out in self.name_to_idx:
                 dst = self.name_to_idx[out]
@@ -87,35 +79,30 @@ class VectorizedGraphExtractor:
                         src = self.name_to_idx[inp]
                         self.edges_list.append([src, dst])
         
-        # Create Edge Index Tensor
         if self.edges_list:
             self.edge_index = torch.tensor(self.edges_list, dtype=torch.long, device=device).t().contiguous()
         else:
             self.edge_index = torch.zeros((2, 0), dtype=torch.long, device=device)
             
-        # Create Boolean Masks for Vectorized Logic
         self.masks = {}
         for t_name, t_id in self.TYPE_MAP.items():
             self.masks[t_name] = (self.node_types == t_id)
 
-        # Pre-build Python adjacency for BFS traversals (Distance calculation)
-        self.adj = [[] for _ in range(self.num_nodes)]       # Forward: src -> [dst]
-        self.parents = [[] for _ in range(self.num_nodes)]  # Backward: dst -> [src]
+        self.adj = [[] for _ in range(self.num_nodes)]
+        self.parents = [[] for _ in range(self.num_nodes)]
         
         for src, dst in self.edges_list:
             self.adj[src].append(dst)
             self.parents[dst].append(src)
             
-        # 3. Compute Metrics Immediately
         self.cc0, self.cc1, self.co = self._compute_scoap_vectorized()
         self.x_base = self._build_base_features()
 
     def _compute_scoap_vectorized(self):
-        """Vectorized SCOAP: Forward Controllability & Backward Observability"""
+        """Vectorized SCOAP computation"""
         num_nodes = self.num_nodes
         src_idx, dst_idx = self.edge_index
         
-        # --- Part A: Controllability (Forward) ---
         cc0 = torch.ones(num_nodes, device=self.device)
         cc1 = torch.ones(num_nodes, device=self.device)
         
@@ -131,7 +118,6 @@ class VectorizedGraphExtractor:
             edge_cc0 = cc0[src_idx]
             edge_cc1 = cc1[src_idx]
             
-            # Aggregate per Gate (Destination)
             min_cc0 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(
                 0, dst_idx, edge_cc0, reduce='min', include_self=False)
             min_cc1 = torch.zeros(num_nodes, device=self.device).scatter_reduce_(
@@ -140,7 +126,6 @@ class VectorizedGraphExtractor:
             sum_cc0 = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, edge_cc0)
             sum_cc1 = torch.zeros(num_nodes, device=self.device).scatter_add_(0, dst_idx, edge_cc1)
             
-            # Apply Logic
             cc0[mask_and] = min_cc0[mask_and] + 1
             cc1[mask_and] = sum_cc1[mask_and] + 1
             
@@ -153,12 +138,10 @@ class VectorizedGraphExtractor:
             cc0[mask_xor] = torch.minimum(sum_cc0[mask_xor], sum_cc1[mask_xor]) + 1
             cc1[mask_xor] = torch.maximum(min_cc0[mask_xor], min_cc1[mask_xor]) + 1
 
-            # Inversions
             temp_cc0 = cc0.clone()
             cc0[mask_inv] = cc1[mask_inv]
             cc1[mask_inv] = temp_cc0[mask_inv]
             
-            # Reset Inputs
             mask_input = self.masks['INPUT']
             cc0[mask_input] = 1.0
             cc1[mask_input] = 1.0
@@ -166,7 +149,6 @@ class VectorizedGraphExtractor:
             if torch.allclose(cc0, cc0_prev) and torch.allclose(cc1, cc1_prev):
                 break
 
-        # --- Part B: Observability (Backward) ---
         co = torch.full((num_nodes,), 1e6, device=self.device)
         
         output_indices = [self.name_to_idx[n] for n in self.parser.all_outputs if n in self.name_to_idx]
@@ -185,7 +167,6 @@ class VectorizedGraphExtractor:
             dst_types = self.node_types[dst_idx]
             side_costs = torch.zeros_like(co_dst)
             
-            # Side input logic
             is_and = (dst_types == self.TYPE_MAP['AND']) | (dst_types == self.TYPE_MAP['NAND'])
             side_costs[is_and] = gate_cc1_sum[dst_idx][is_and] - cc1[src_idx][is_and]
             
@@ -216,25 +197,20 @@ class VectorizedGraphExtractor:
         prop_dst = src_idx if reverse else dst_idx
         
         for _ in range(50):
-            changed = False
             src_depths = d_vals[prop_src]
             new_depths = torch.zeros(self.num_nodes, device=self.device).scatter_reduce_(
                 0, prop_dst, src_depths, reduce='amax', include_self=True
             )
             new_depths = new_depths + 1
-            if not torch.allclose(d_vals, new_depths):
-                d_vals = new_depths
-                changed = True
-            if not changed: break
+            if torch.allclose(d_vals, new_depths):
+                break
+            d_vals = new_depths
             
         max_d = d_vals.max() if d_vals.max() > 0 else 1.0
         return (d_vals / max_d).unsqueeze(1)
 
     def _build_base_features(self):
-        """
-        Builds 16-dimensional feature matrix
-        [0-7]: Type, [8-9]: Depth, [10-11]: Fault, [12-14]: SCOAP, [15]: Output
-        """
+        """Builds 16-dimensional feature matrix"""
         x_type = torch.nn.functional.one_hot(self.node_types, num_classes=8).float()
         fwd_depth = self._compute_depth_fast(reverse=False)
         rev_depth = self._compute_depth_fast(reverse=True)
@@ -258,9 +234,8 @@ class VectorizedGraphExtractor:
         tid = self.name_to_idx.get(fault_name)
         
         if tid is not None:
-            x[tid, 10] = 1.0 # Mark target
+            x[tid, 10] = 1.0
             
-            # BFS for Distance (Index 11)
             dist = torch.full((self.num_nodes,), -1.0, device=self.device)
             dist[tid] = 0.0
             queue = [tid]
@@ -292,17 +267,14 @@ class VectorizedGraphExtractor:
 # CONFIGS
 # =============================================================================
 BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
-DATASET_PATH = "dataset_oracle_dual_16feat.pt"
+DATASET_PATH = "dataset_complete_atpg_16feat.pt"
 SAMPLES_PER_FILE = 50
-MODEL_PATH = "gnn_model_dual_task_16feat.pth"
+MODEL_PATH = "gnn_model_polarity_16feat.pth"
 EPOCHS = 20
 BATCH_SIZE = 32
 GENERATE_TRAIN_DATA_DIR = "../I99T"
 SEED = 42
 
-# =============================================================================
-# 0. DETERMINISM SETUP
-# =============================================================================
 def set_global_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -315,7 +287,7 @@ def set_global_seed(seed):
 set_global_seed(SEED)
 
 # =============================================================================
-# PART 1: OPTIMIZED PARALLEL DATA GENERATION (CONE BASED)
+# PART 1: DATA GENERATION WITH COMPLETE ATPG CONES
 # =============================================================================
 
 def get_target_files(DIR):
@@ -327,12 +299,11 @@ def get_target_files(DIR):
                 full_path = os.path.join(root, f)
                 rel_path = os.path.relpath(full_path, DIR)
                 file_list.append(rel_path)
-    # Sort largest first for better scheduling
-    return sorted(file_list, key=lambda x: os.path.getsize(os.path.join(DIR, x)), reverse=True)
+    return sorted(file_list, key=lambda x: os.path.getsize(os.path.join(DIR, x)))
 
 def process_single_circuit(filename):
-    """Worker using CONE SPLITTING to handle Large Circuits."""
-    set_global_seed(SEED + len(filename)) 
+    """Worker using COMPLETE ATPG CONE extraction"""
+    set_global_seed(SEED + hash(filename) % 10000) 
     filepath = os.path.join(GENERATE_TRAIN_DATA_DIR, filename)
     local_dataset = []
 
@@ -340,31 +311,31 @@ def process_single_circuit(filename):
         miter = WireFaultMiter(filepath)
         if not miter.gates: return []
         
-        # Adjust samples based on size (Giant circuits get fewer samples, but higher quality)
         num_gates = len(miter.gates)
         local_samples = 10 if num_gates > 5000 else SAMPLES_PER_FILE
         
         extractor = VectorizedGraphExtractor(filepath, var_map=miter.parser.build_var_map(), device='cpu')
         
-        print(f"[{filename}] Mining {local_samples} samples (Cone Optimized)...", flush=True)
+        print(f"[{filename}] Mining {local_samples} samples (Complete ATPG Cone)...", flush=True)
 
         for i in range(local_samples):
-            # 1. Pick a Fault
             target_gate = random.choice(miter.gates)[0]
             
-            # 2. Extract a Valid Cone (Instead of solving whole circuit)
             outs = miter.get_reachable_outputs(target_gate)
             if not outs: continue
             
             target_out = random.choice(outs)
-            cone_gates = miter.get_logic_cone([target_out], target_gate)
             
-            # 3. Swap Gates & Build Miter
+            # ✨ USE COMPLETE ATPG CONE
+            complete_cone = miter.get_complete_atpg_cone(target_gate, target_out)
+            
+            if not complete_cone: continue
+            
             orig_gates = miter.gates
-            miter.gates = cone_gates
+            miter.gates = complete_cone
             
-            clauses = miter.build_miter(target_gate, None, 1) # SA1
-            miter.gates = orig_gates # Restore immediately
+            clauses = miter.build_miter(target_gate, 1, 1)  # SA1
+            miter.gates = orig_gates
             
             with Glucose3(bootstrap_with=clauses) as solver:
                 solver.conf_budget(5000)
@@ -373,11 +344,8 @@ def process_single_circuit(filename):
                 model = solver.get_model()
                 if not model: continue
                 
-                # 4. Probe Inputs (Only those in the Cone!)
-                cone_inputs = set()
-                for _, _, inps in cone_gates:
-                    for inp in inps:
-                        if inp in miter.inputs: cone_inputs.add(inp)
+                # ✨ USE HELPER METHOD
+                cone_inputs = miter.get_cone_inputs(complete_cone)
                 
                 probe_list = list(cone_inputs)
                 if len(probe_list) > 50: probe_list = random.sample(probe_list, 50)
@@ -402,7 +370,6 @@ def process_single_circuit(filename):
                         input_importance[input_name] = imp if res else 2000
                         input_polarity[input_name] = 1.0 if var_id in model else 0.0
 
-                    # 5. Build Data Object
                     if input_importance:
                         data = extractor.get_data_for_fault(target_gate)
                         max_imp = max(input_importance.values())
@@ -424,12 +391,11 @@ def process_single_circuit(filename):
 
     except Exception as e:
         print(f"[{filename}] Error: {e}", flush=True)
-        return []
 
     return local_dataset
 
 def generate_dataset():
-    print(f"--- MINING DATA (CONE OPTIMIZED) ---")
+    print(f"--- GENERATING DATA (Complete ATPG Cones) ---")
     if not os.path.exists(GENERATE_TRAIN_DATA_DIR): return
 
     files = get_target_files(GENERATE_TRAIN_DATA_DIR)
@@ -444,10 +410,11 @@ def generate_dataset():
             dataset.extend(res)
 
     torch.save(dataset, DATASET_PATH)
+    print(f"✓ Saved {len(dataset)} samples to {DATASET_PATH}")
 
 
 # =============================================================================
-# PART 2 & 3: MODEL AND TRAINING (UNCHANGED)
+# PART 2 & 3: MODEL AND TRAINING
 # =============================================================================
 
 class CircuitGNN_DualTask(torch.nn.Module):
@@ -515,14 +482,15 @@ def train_model():
         print(f"Epoch {epoch+1}/{EPOCHS}: Loss={total_loss/len(train_loader):.4f}")
     
     torch.save(model.state_dict(), MODEL_PATH)
+    print(f"✓ Model saved to {MODEL_PATH}")
 
 
 # =============================================================================
-# PART 4: DETERMINISTIC BENCHMARKING (OPTIMIZED)
+# PART 4: BENCHMARKING (POLARITY ONLY)
 # =============================================================================
 
 def run_benchmark():
-    print(f"--- BENCHMARKING (GNN + CONE SPLIT + BRANCHLESS) ---")
+    print(f"--- BENCHMARKING (Polarity-Only Guidance) ---")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = CircuitGNN_DualTask(num_node_features=16).to(device)
@@ -549,64 +517,84 @@ def run_benchmark():
             extractor = VectorizedGraphExtractor(filepath, var_map=miter.var_map, device=device.type)
             all_gates = sorted(miter.gates, key=lambda x: x[0])
             
-            # Run 10 faults
             for i in range(10): 
                 target_gate = random.choice(all_gates)[0]
                 
-                # 1. Inference
-                t_gnn_start = time.time()
-                data = extractor.get_data_for_fault(target_gate)
-                data = data.to(device)
+                # === BASELINE ===
+                clauses_std = miter.build_miter(target_gate, 1, 1)
+                
+                t_std = time.time()
+                with Minisat22(bootstrap_with=clauses_std) as solver:
+                    std_result = solver.solve()
+                    std_conflicts = solver.accum_stats()['conflicts']
+                std_time = time.time() - t_std
+                
+                # === GNN (POLARITY ONLY) ===
+                t_gnn = time.time()
+                
+                data = extractor.get_data_for_fault(target_gate).to(device)
                 
                 with torch.no_grad():
-                    imp_scores, pol_scores = model(data)
+                    _, pol_scores = model(data)  # ✨ Only use polarity!
                 
-                # 2. Extract Hints
-                hints = []
+                # Build polarity hints (order doesn't matter)
+                hint_lits = []
                 for idx, name in enumerate(data.node_names):
                     if name in miter.inputs:
-                        imp = imp_scores[idx].item()
                         prob = pol_scores[idx].item()
                         var_id = miter.var_map.get(name)
                         if var_id:
-                            val = 1 if prob > 0.5 else 0
-                            # Map 0 -> -Lit, 1 -> Lit
-                            hints.append((var_id if val else -var_id, imp))
-                            
-                hints.sort(key=lambda x: -x[1])
-                hint_lits = [h[0] for h in hints]
+                            hint_lits.append(var_id if prob > 0.5 else -var_id)
                 
-                # 3. Solve using Optimized Cone Strategy with Hints
-                assignment = miter.solve_fault_specific_cones(target_gate, gnn_hints=hint_lits)
+                clauses_gnn = miter.build_miter(target_gate, 1, 1)
                 
-                dur = time.time() - t_gnn_start
-                status = "DETECTED" if assignment else "UNSAT/UNDETECTED"
-                print(f"  Fault {target_gate}: {status} in {dur:.4f}s")
-                if assignment:
-                    # Print Compact Vector
-                    vec = "".join([str(assignment.get(k, 'X')) for k in sorted(miter.inputs)])
-                    print(f"  Vector: {vec[:50]}...")
+                with Minisat22(bootstrap_with=clauses_gnn) as solver:
+                    if hint_lits:
+                        solver.set_phases(hint_lits)  # ✨ Just set polarity
+                    
+                    gnn_result = solver.solve()
+                    gnn_conflicts = solver.accum_stats()['conflicts']
+                
+                gnn_time = time.time() - t_gnn
+                
+                speedup = std_conflicts / max(gnn_conflicts, 1)
+                status = "SAT" if gnn_result else "UNSAT"
+                
+                print(f"  Fault {i+1}/10 ({target_gate}): {std_conflicts} → {gnn_conflicts} ({speedup:.2f}x)")
                 
                 results.append({
                     "Circuit": filename,
                     "Fault": target_gate,
                     "Status": status,
-                    "Time": dur
+                    "Std_Conflicts": std_conflicts,
+                    "GNN_Conflicts": gnn_conflicts,
+                    "Speedup": speedup,
+                    "Std_Time": std_time,
+                    "GNN_Time": gnn_time
                 })
                 
         except Exception as e:
             print(f"Error: {e}")
 
     if results:
-        with open("results_optimized.csv", 'w', newline='') as f:
+        with open("results_polarity_only.csv", 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=results[0].keys())
             writer.writeheader()
             writer.writerows(results)
-        print("Saved to results_optimized.csv")
+        
+        total = len(results)
+        avg_speedup = sum(r['Speedup'] for r in results) / total
+        improved = sum(1 for r in results if r['Speedup'] > 1.0)
+        
+        print(f"\n{'='*80}")
+        print(f"RESULTS: {total} tests, {improved} improved ({improved/total*100:.1f}%)")
+        print(f"Average speedup: {avg_speedup:.2f}x")
+        print(f"Saved to: results_polarity_only.csv")
+        print(f"{'='*80}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python data_train_bench_mem_efficient.py [generate|train|benchmark]")
+        print("Usage: python pipeline_complete_fixed.py [generate|train|benchmark]")
     else:
         cmd = sys.argv[1]
         if cmd == "generate": generate_dataset()
