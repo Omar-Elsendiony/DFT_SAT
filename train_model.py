@@ -15,7 +15,7 @@ import numpy as np
 # =============================================================================
 # CONFIGS
 # =============================================================================
-DATASET_PATH = "dataset_hybrid_17feat.pt"
+DATASET_PATH = "dataset_complete_atpg_17feat.pt"
 MODEL_PATH = "gnn_model_dual_task_17feat.pth"
 EPOCHS = 20
 BATCH_SIZE = 32

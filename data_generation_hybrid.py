@@ -22,10 +22,10 @@ from neuro_utils import VectorizedGraphExtractor
 # =============================================================================
 GENERATE_TRAIN_DATA_DIR = "../I99T"
 DATASET_PATH = "dataset_complete_atpg_17feat.pt"
-SAMPLES_PER_FILE = 20
-MAX_PROBES = 50
+SAMPLES_PER_FILE = 30
+MAX_PROBES = 100
 CONFLICT_BUDGET = 5000
-SKIP_SIZE_THRESHOLD = 10000
+SKIP_SIZE_THRESHOLD = 100000
 NUM_WORKERS = 8
 SEED = 42
 
