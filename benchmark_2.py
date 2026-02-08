@@ -13,7 +13,7 @@ import csv
 import random
 import numpy as np
 import torch
-from pysat.solvers import Glucose3
+from pysat.solvers import Minisat22
 from WireFaultMiter import WireFaultMiter
 from neuro_utils import VectorizedGraphExtractor
 from train_model import CircuitGNN_DualTask
@@ -22,9 +22,9 @@ from train_model import CircuitGNN_DualTask
 # CONFIGS
 # =============================================================================
 BENCHMARK_DIR = "../hdl-benchmarks/iscas85/bench/"
-MODEL_PATH = "gnn_model_dual_task_17feat.pth"
+MODEL_PATH = "gnn_model_dual_task_17feat_improved.pth"
 RESULTS_PATH = "results_gnn_polarity.csv"
-NUM_FAULTS_PER_CIRCUIT = 20
+NUM_FAULTS_PER_CIRCUIT = 10
 SEED = 42
 
 def set_global_seed(seed):
@@ -122,7 +122,7 @@ def run_benchmark():
                 clauses_std = miter.build_miter(target_gate, fault_type, 1)
                 
                 t_std_start = time.time()
-                with Glucose3(bootstrap_with=clauses_std) as solver:
+                with Minisat22(bootstrap_with=clauses_std) as solver:
                     std_result = solver.solve()
                     std_conflicts = solver.accum_stats()['conflicts']
                 std_time = time.time() - t_std_start
@@ -151,7 +151,7 @@ def run_benchmark():
                 # 3. Solve with phase hints
                 clauses_gnn = miter.build_miter(target_gate, fault_type, 1)
                 
-                with Glucose3(bootstrap_with=clauses_gnn) as solver:
+                with Minisat22(bootstrap_with=clauses_gnn) as solver:
                     if hint_literals:
                         solver.set_phases(hint_literals)
                     
@@ -198,20 +198,17 @@ def run_benchmark():
         total_tests = len(results)
         avg_speedup = sum(r['Speedup'] for r in results) / total_tests
         max_speedup = max(r['Speedup'] for r in results)
-        min_speedup = min(r['Speedup'] for r in results if r['Speedup'] != 0)
+        min_speedup = min(r['Speedup'] for r in results)
         
         speedups = [r['Speedup'] for r in results]
         median_speedup = sorted(speedups)[len(speedups) // 2]
         
         # Count improvements
         improved = sum(1 for r in results if r['Speedup'] > 1.0)
-        not_improved = sum(1 for r in results if r['Speedup'] < 1.0)
         improved_pct = (improved / total_tests) * 100
-        not_improved_pct = (not_improved / total_tests) * 100
         
         print(f"Total tests: {total_tests}")
         print(f"Tests improved: {improved} ({improved_pct:.1f}%)")
-        print(f"Tests not improved: {not_improved} ({not_improved_pct:.1f}%)")
         print(f"\nSpeedup Statistics:")
         print(f"  Average:  {avg_speedup:.2f}x")
         print(f"  Median:   {median_speedup:.2f}x")

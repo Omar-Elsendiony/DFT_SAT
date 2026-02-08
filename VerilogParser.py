@@ -1,5 +1,10 @@
 r"""
-VerilogParser - Enhanced for Yosys Output
+VerilogParser - Enhanced for Yosys Output (FIXED: Consistent Wire Ordering)
+
+CRITICAL FIX:
+- get_all_wires() now matches BenchParser behavior exactly
+- Only includes wires that are actually used in gates
+- Ensures consistent node ordering between .bench and .v formats
 
 Handles:
 - Yosys header comments
@@ -226,10 +231,27 @@ class VerilogParser:
     # =========================================================================
     
     def get_all_wires(self):
-        wires = set(self.all_inputs + self.all_outputs + self.wires)
+        """
+        CRITICAL FIX: Match BenchParser behavior exactly!
+        
+        Only include wires that are ACTUALLY USED in the circuit:
+        - Primary inputs/outputs (all_inputs, all_outputs)
+        - Wires referenced in gates (outputs and inputs)
+        
+        DO NOT include declared-but-unused wires from self.wires!
+        This ensures consistent ordering with BenchParser.
+        """
+        # Start with inputs and outputs (same as BenchParser)
+        wires = set(self.all_inputs + self.all_outputs)
+        
+        # Add wires used in gates (same as BenchParser)
         for out, _, inputs in self.gates:
             wires.add(out)
             wires.update(inputs)
+        
+        # DO NOT add self.wires here - this was the bug!
+        # self.wires may contain declared-but-unused wires
+        
         return sorted(list(wires))
     
     def build_var_map(self):
