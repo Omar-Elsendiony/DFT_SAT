@@ -80,15 +80,21 @@ def process_single_fault(args):
             parser = VerilogParser(bench_file)
         
         # Create fault miter
-        miter = WireFaultMiter(parser)
-        fault_type_name = "SA1" if fault_type == 1 else "SA0"
-        clauses = miter.create_wire_fault_miter(fault_name, fault_type_name)
+        miter = WireFaultMiter(bench_file)
+        fault_type_int = fault_type  # 0 or 1
+        clauses = miter.build_miter(fault_name, fault_type_int, force_diff=1)
         
         if not clauses:
             return None
         
         # Get complete ATPG cone
-        complete_cone = miter.get_complete_cone(fault_name)
+        reachable = miter.get_reachable_outputs(fault_name)
+        if not reachable:
+            return None
+        
+        target_output = reachable[0]
+        complete_cone = miter.get_complete_atpg_cone(fault_name, target_output)
+        
         if not complete_cone:
             return None
         
@@ -115,9 +121,7 @@ def process_single_fault(args):
             return None
         
         # Create graph data for this fault
-        # Assuming extractor is a VectorizedGraphExtractor instance
-        # You'll need to reconstruct it from extractor_data
-        extractor = VectorizedGraphExtractor.from_saved_data(extractor_data)
+        extractor = VectorizedGraphExtractor(bench_file, var_map=miter.var_map, device='cpu')
         data = extractor.get_data_for_fault(fault_name, fault_type=fault_type)
         
         # Build labels - ONLY for critical inputs
@@ -164,12 +168,13 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4):
     else:
         parser = VerilogParser(bench_file)
     
-    # Get all gates for fault injection
-    all_gates = list(parser.gates.keys())
+    # FIXED: Use gate_dict.keys() instead of gates.keys()
+    # parser.gates is a list, parser.gate_dict is a dict
+    all_gates = list(parser.gate_dict.keys())
     
     # Create extractor and save its data for worker processes
-    extractor = VectorizedGraphExtractor(parser)
-    extractor_data = extractor.save_data()
+    extractor = VectorizedGraphExtractor(bench_file, var_map=parser.var_map, device='cpu')
+    extractor_data = bench_file  # Pass filename instead of trying to serialize extractor
     
     # Generate fault list (both SA0 and SA1 for each gate)
     fault_list = []
@@ -234,15 +239,70 @@ def load_and_merge_datasets(data_dir):
     return dataset
 
 
+def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
+    """
+    Generate training dataset for all circuits in a folder.
+    
+    Args:
+        bench_folder: Path to folder containing .bench or .v files
+        output_dir: Where to save the datasets
+        num_workers: Number of parallel workers
+    
+    Returns:
+        Total number of samples generated across all circuits
+    """
+    from pathlib import Path
+    
+    bench_folder = Path(bench_folder)
+    bench_files = list(bench_folder.glob('*.bench')) + list(bench_folder.glob('*.v'))
+    
+    if not bench_files:
+        print(f"No .bench or .v files found in {bench_folder}")
+        return 0
+    
+    print(f"Found {len(bench_files)} circuits in {bench_folder}")
+    bench_files = sorted(bench_files)
+    
+    total_samples = 0
+    for i, bench_file in enumerate(bench_files):
+        print(f"\n{'='*70}")
+        print(f"[{i+1}/{len(bench_files)}] Processing {bench_file.name}...")
+        print(f"{'='*70}")
+        
+        dataset = generate_dataset_parallel(str(bench_file), output_dir, num_workers)
+        total_samples += len(dataset)
+    
+    print(f"\n{'='*70}")
+    print(f"ALL CIRCUITS COMPLETE")
+    print(f"{'='*70}")
+    print(f"Total circuits processed: {len(bench_files)}")
+    print(f"Total samples generated: {total_samples}")
+    
+    return total_samples
+
+
 if __name__ == "__main__":
     import argparse
+    from pathlib import Path
     
     parser = argparse.ArgumentParser(description='Generate training data with critical input filtering')
-    parser.add_argument('--bench', type=str, required=True, help='Path to .bench or .v file')
+    parser.add_argument('--bench', type=str, required=True, 
+                       help='Path to .bench/.v file or folder containing them')
     parser.add_argument('--output', type=str, default='./training_data_critical', 
                        help='Output directory')
     parser.add_argument('--workers', type=int, default=4, help='Number of parallel workers')
     
     args = parser.parse_args()
     
-    generate_dataset_parallel(args.bench, args.output, args.workers)
+    # Check if bench is a file or folder
+    bench_path = Path(args.bench)
+    
+    if bench_path.is_dir():
+        # Process entire folder
+        generate_dataset_for_folder(args.bench, args.output, args.workers)
+    elif bench_path.is_file():
+        # Process single file
+        generate_dataset_parallel(args.bench, args.output, args.workers)
+    else:
+        print(f"Error: {args.bench} is not a valid file or directory")
+        exit(1)
