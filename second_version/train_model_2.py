@@ -310,7 +310,7 @@ def train_model(args):
     
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        optimizer, mode='min', factor=0.5, patience=10
     )
     
     # Training loop
@@ -367,7 +367,7 @@ def train_model(args):
     
     # Load best model and evaluate on test set
     print("\nLoading best model for final evaluation...")
-    checkpoint = torch.load(args.save_path)
+    checkpoint = torch.load(args.save_path, weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     test_loss, test_acc = evaluate(model, test_loader, device)
@@ -405,7 +405,7 @@ if __name__ == "__main__":
                        help='Dropout rate')
     
     # Training
-    parser.add_argument('--epochs', type=int, default=200,
+    parser.add_argument('--epochs', type=int, default=3,
                        help='Maximum number of epochs')
     parser.add_argument('--batch_size', type=int, default=32,
                        help='Batch size')

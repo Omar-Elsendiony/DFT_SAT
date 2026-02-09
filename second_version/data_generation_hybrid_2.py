@@ -59,9 +59,11 @@ def identify_critical_inputs_batched(clauses, assignment, cone_inputs, var_map):
     # OPTIMIZATION 1: Test all inputs with a single solver instance
     # Instead of creating N solvers, reuse one
     with Glucose3(bootstrap_with=clauses) as probe:
-        probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
         
         for inp, var_id, correct_polarity, test_literal in test_inputs:
+            # Set budget for THIS solve call (must be done each time)
+            probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
+            
             # Test with opposite polarity
             result = probe.solve(assumptions=[test_literal])
             
