@@ -196,7 +196,7 @@ def run_benchmark():
     print(f"Loading model from {MODEL_PATH}...")
     
     # Load checkpoint
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
+    checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
     
     # Get model architecture from checkpoint
     model = CircuitGNN_Polarity(

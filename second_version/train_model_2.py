@@ -367,7 +367,7 @@ def train_model(args):
     
     # Load best model and evaluate on test set
     print("\nLoading best model for final evaluation...")
-    checkpoint = torch.load(args.save_path, weights_only=True)
+    checkpoint = torch.load(args.save_path, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     test_loss, test_acc = evaluate(model, test_loader, device)
