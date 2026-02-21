@@ -1,11 +1,8 @@
 """
-ROBUST ADAPTIVE data generation with proper deadlock prevention
+ROBUST data generation with PyTorch pickling fix
 
-Fixes:
-1. Per-fault timeout using multiprocessing.Pool with timeout
-2. Smaller chunksizes to avoid worker hanging
-3. Progress tracking to detect stalls
-4. Graceful handling of stuck faults
+Key fix: Workers return plain Python dicts instead of PyTorch tensors
+Main process converts to PyTorch tensors after collecting results
 """
 
 from pysat.solvers import Glucose3, Minisat22
@@ -17,6 +14,7 @@ import random
 import os
 import pickle
 import time
+import numpy as np
 
 from BenchParser import BenchParser
 from VerilogParser import VerilogParser  
@@ -25,7 +23,7 @@ from neuro_utils import VectorizedGraphExtractor
 
 CONFLICT_BUDGET = 10000
 CRITICAL_INPUT_TEST_BUDGET = 20
-PER_FAULT_TIMEOUT = 30  # Max 30 seconds per fault
+PER_FAULT_TIMEOUT = 300  # 5 minutes per fault
 
 
 def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map):
@@ -75,14 +73,17 @@ def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map)
                 if len(critical_inputs) >= 5:
                     break
     except Exception as e:
-        # If anything fails, return what we have
         pass
     
     return critical_inputs
 
 
 def process_single_fault(args):
-    """Process single fault - MUST be top-level for pickling"""
+    """
+    Process single fault - Returns PLAIN PYTHON DICT (not PyTorch tensors!)
+    
+    This avoids PyTorch tensor pickling issues in multiprocessing.
+    """
     bench_file, fault_name, fault_type = args
     
     try:
@@ -131,45 +132,67 @@ def process_single_fault(args):
         if len(critical_inputs) < 1:
             return None
         
-        # Create graph data
+        # Get graph data
         extractor = VectorizedGraphExtractor(bench_file, var_map=miter.var_map, device='cpu')
         data = extractor.get_data_for_fault(fault_name, fault_type=fault_type)
         
-        # Build labels
-        y_polarity = torch.zeros(len(data.node_names), 1)
-        train_mask = torch.zeros(len(data.node_names), 1)
-        importance = torch.zeros(len(data.node_names), 1)
+        # CRITICAL FIX: Convert to plain Python dict instead of returning PyTorch Data
+        result = {
+            'node_names': list(data.node_names),  # List of strings
+            'x': data.x.cpu().numpy(),  # Convert to numpy array
+            'edge_index': data.edge_index.cpu().numpy(),  # Convert to numpy
+            'critical_inputs': critical_inputs,  # Already a dict
+            'fault_name': fault_name,
+            'fault_type': fault_type,
+            'num_critical_inputs': len(critical_inputs)
+        }
         
-        for k, node_name in enumerate(data.node_names):
-            if node_name in critical_inputs:
-                y_polarity[k] = critical_inputs[node_name]
-                train_mask[k] = 1.0
-                importance[k] = 1.0
-        
-        # Attach to data object
-        data.y_polarity = y_polarity
-        data.train_mask = train_mask
-        data.y_importance = importance
-        data.fault_name = fault_name
-        data.fault_type = fault_type
-        data.num_critical_inputs = len(critical_inputs)
-        
-        return data
+        return result
         
     except Exception as e:
         # Silently skip problematic faults
         return None
 
 
-def generate_dataset_parallel(bench_file, output_dir, num_workers=4):
+def dict_to_data(result_dict):
     """
-    Generate dataset with robust deadlock prevention.
+    Convert plain Python dict back to PyTorch Data object.
     
-    Key improvements:
-    1. Smaller chunksize (1 instead of 10) - prevents workers from getting stuck
-    2. Timeout on results iteration - detects stalls
-    3. Progress tracking - reports if no progress for 60 seconds
+    This is done in the main process, not in workers, so no pickling issues.
     """
+    # Convert numpy arrays back to tensors
+    x = torch.from_numpy(result_dict['x']).float()
+    edge_index = torch.from_numpy(result_dict['edge_index']).long()
+    
+    # Create labels
+    node_names = result_dict['node_names']
+    critical_inputs = result_dict['critical_inputs']
+    
+    y_polarity = torch.zeros(len(node_names), 1)
+    train_mask = torch.zeros(len(node_names), 1)
+    importance = torch.zeros(len(node_names), 1)
+    
+    for k, node_name in enumerate(node_names):
+        if node_name in critical_inputs:
+            y_polarity[k] = critical_inputs[node_name]
+            train_mask[k] = 1.0
+            importance[k] = 1.0
+    
+    # Create Data object
+    data = Data(x=x, edge_index=edge_index)
+    data.node_names = node_names
+    data.y_polarity = y_polarity
+    data.train_mask = train_mask
+    data.y_importance = importance
+    data.fault_name = result_dict['fault_name']
+    data.fault_type = result_dict['fault_type']
+    data.num_critical_inputs = result_dict['num_critical_inputs']
+    
+    return data
+
+
+def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interval=100):
+    """Generate dataset with PyTorch pickling fix and incremental saving"""
     
     # Parse circuit once
     if bench_file.endswith('.bench'):
@@ -187,59 +210,95 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4):
     
     print(f"Processing {len(fault_list)} faults using {num_workers} workers (ROBUST ADAPTIVE mode)...")
     
+    # Setup save paths
+    os.makedirs(output_dir, exist_ok=True)
+    circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+    save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs.pkl')
+    temp_save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs_temp.pkl')
+    
+    # Try to load existing progress
     dataset = []
+    if os.path.exists(save_path):
+        try:
+            with open(save_path, 'rb') as f:
+                dataset = pickle.load(f)
+            print(f"Resumed from existing file: {len(dataset)} samples already collected")
+        except:
+            print("Could not load existing file, starting fresh")
+    
     last_progress_time = time.time()
     last_count = 0
+    processed_count = 0
+    last_save_count = len(dataset)
     
     # Use smaller chunksize to avoid deadlock
     with Pool(num_workers) as pool:
-        # CRITICAL: Use chunksize=1 to prevent workers from getting stuck on one bad chunk
         async_result = pool.imap_unordered(process_single_fault, fault_list, chunksize=1)
         
         for i in range(len(fault_list)):
             try:
-                # Timeout on getting each result
-                data = async_result.next(timeout=PER_FAULT_TIMEOUT)
+                # Get result with timeout
+                result_dict = async_result.next(timeout=PER_FAULT_TIMEOUT)
+                processed_count += 1
                 
-                if data is not None:
+                # Convert dict to Data object in main process (no pickling!)
+                if result_dict is not None:
+                    data = dict_to_data(result_dict)
                     dataset.append(data)
+                
+                # INCREMENTAL SAVE: Save every 100 new samples
+                if len(dataset) - last_save_count >= save_interval:
+                    try:
+                        # Save to temp file first
+                        with open(temp_save_path, 'wb') as f:
+                            pickle.dump(dataset, f)
+                        # Then rename to actual file (atomic operation)
+                        os.replace(temp_save_path, save_path)
+                        last_save_count = len(dataset)
+                        print(f"  → Saved checkpoint: {len(dataset)} samples")
+                    except Exception as e:
+                        print(f"  Warning: Could not save checkpoint: {e}")
                 
                 # Progress tracking
                 current_time = time.time()
-                if (i + 1) % 100 == 0:
+                if processed_count % 100 == 0:
                     elapsed = current_time - last_progress_time
-                    rate = (i + 1 - last_count) / elapsed if elapsed > 0 else 0
-                    eta_seconds = (len(fault_list) - i - 1) / rate if rate > 0 else 0
+                    rate = (processed_count - last_count) / elapsed if elapsed > 0 else 0
+                    eta_seconds = (len(fault_list) - processed_count) / rate if rate > 0 else 0
                     
-                    print(f"Processed {i+1}/{len(fault_list)} faults, "
+                    print(f"Processed {processed_count}/{len(fault_list)} faults, "
                           f"collected {len(dataset)} samples "
                           f"(~{rate:.1f} faults/s, ETA: {eta_seconds/60:.1f} min)")
                     
                     last_progress_time = current_time
-                    last_count = i + 1
+                    last_count = processed_count
                 
             except MPTimeoutError:
-                # Fault took too long, skip it
-                print(f"  Warning: Fault {i+1} timed out after {PER_FAULT_TIMEOUT}s, skipping...")
+                processed_count += 1
+                print(f"  Warning: Fault {processed_count} timed out after {PER_FAULT_TIMEOUT}s, skipping...")
                 continue
             except StopIteration:
                 break
             except Exception as e:
-                print(f"  Warning: Error processing fault {i+1}: {e}")
+                processed_count += 1
+                print(f"  Warning: Error processing fault {processed_count}: {e}")
                 continue
     
     print(f"\nDataset generation complete!")
-    print(f"Total samples: {len(dataset)}")
+    print(f"Total faults processed: {processed_count}/{len(fault_list)}")
+    print(f"Total samples collected: {len(dataset)}")
     
-    # Save dataset
-    os.makedirs(output_dir, exist_ok=True)
-    circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
-    save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs.pkl')
-    
-    with open(save_path, 'wb') as f:
-        pickle.dump(dataset, f)
-    
-    print(f"Saved to {save_path}")
+    # Final save
+    try:
+        with open(save_path, 'wb') as f:
+            pickle.dump(dataset, f)
+        print(f"Saved final dataset to {save_path}")
+        
+        # Clean up temp file if it exists
+        if os.path.exists(temp_save_path):
+            os.remove(temp_save_path)
+    except Exception as e:
+        print(f"Warning: Could not save final dataset: {e}")
     
     # Print statistics
     if dataset:
@@ -257,7 +316,7 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
     from pathlib import Path
     
     bench_folder = Path(bench_folder)
-    bench_files = list(bench_folder.rglob('*.bench')) + list(bench_folder.rglob('*.v'))
+    bench_files = list(bench_folder.glob('*.bench')) + list(bench_folder.glob('*.v'))
     
     if not bench_files:
         print(f"No .bench or .v files found in {bench_folder}")
@@ -284,6 +343,8 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
             print(f"Circuit completed in {circuit_time:.1f}s ({len(dataset)} samples)")
         except Exception as e:
             print(f"Error processing {bench_file.name}: {e}")
+            import traceback
+            traceback.print_exc()
             print(f"Continuing to next circuit...")
             continue
     
@@ -304,7 +365,7 @@ if __name__ == "__main__":
     import argparse
     from pathlib import Path
     
-    parser = argparse.ArgumentParser(description='Generate training data (ROBUST ADAPTIVE)')
+    parser = argparse.ArgumentParser(description='Generate training data (FIXED multiprocessing)')
     parser.add_argument('--bench', type=str, required=True,
                        help='Path to .bench/.v file or folder containing them')
     parser.add_argument('--output', type=str, default='./training_data_critical',
@@ -313,6 +374,8 @@ if __name__ == "__main__":
                        help='Number of parallel workers')
     parser.add_argument('--timeout', type=int, default=30,
                        help='Timeout per fault in seconds')
+    parser.add_argument('--save_interval', type=int, default=100,
+                       help='Save checkpoint every N samples')
     
     args = parser.parse_args()
     
@@ -324,7 +387,7 @@ if __name__ == "__main__":
     if bench_path.is_dir():
         generate_dataset_for_folder(args.bench, args.output, args.workers)
     elif bench_path.is_file():
-        generate_dataset_parallel(args.bench, args.output, args.workers)
+        generate_dataset_parallel(args.bench, args.output, args.workers, args.save_interval)
     else:
         print(f"Error: {args.bench} is not a valid file or directory")
         exit(1)
