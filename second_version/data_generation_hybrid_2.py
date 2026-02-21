@@ -1,8 +1,11 @@
 """
-ROBUST data generation with PyTorch pickling fix
+Data generation with RANDOM FAULT SAMPLING
 
-Key fix: Workers return plain Python dicts instead of PyTorch tensors
-Main process converts to PyTorch tensors after collecting results
+Features:
+- Sample N random faults per circuit instead of processing all
+- Incremental saving every 100 samples
+- Resume from checkpoint
+- No PyTorch pickling issues
 """
 
 from pysat.solvers import Glucose3, Minisat22
@@ -23,7 +26,7 @@ from neuro_utils import VectorizedGraphExtractor
 
 CONFLICT_BUDGET = 10000
 CRITICAL_INPUT_TEST_BUDGET = 20
-PER_FAULT_TIMEOUT = 300  # 5 minutes per fault
+PER_FAULT_TIMEOUT = 300
 
 
 def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map):
@@ -63,7 +66,6 @@ def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map)
                     critical_inputs[inp] = 1.0 if correct_polarity else 0.0
                     tests_since_last_critical = 0
                 
-                # Early termination
                 if len(critical_inputs) >= 3 and tests_since_last_critical >= 3:
                     break
                 
@@ -72,35 +74,28 @@ def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map)
                 
                 if len(critical_inputs) >= 5:
                     break
-    except Exception as e:
+    except:
         pass
     
     return critical_inputs
 
 
 def process_single_fault(args):
-    """
-    Process single fault - Returns PLAIN PYTHON DICT (not PyTorch tensors!)
-    
-    This avoids PyTorch tensor pickling issues in multiprocessing.
-    """
+    """Process single fault - Returns plain Python dict"""
     bench_file, fault_name, fault_type = args
     
     try:
-        # Parse circuit
         if bench_file.endswith('.bench'):
             parser = BenchParser(bench_file)
         else:
             parser = VerilogParser(bench_file)
         
-        # Create fault miter
         miter = WireFaultMiter(bench_file)
         clauses = miter.build_miter(fault_name, fault_type, force_diff=1)
         
         if not clauses:
             return None
         
-        # Get complete ATPG cone
         reachable = miter.get_reachable_outputs(fault_name)
         if not reachable:
             return None
@@ -111,7 +106,6 @@ def process_single_fault(args):
         if not complete_cone:
             return None
         
-        # Solve to find if fault is testable
         with Glucose3(bootstrap_with=clauses) as solver:
             solver.conf_budget(CONFLICT_BUDGET)
             if not solver.solve():
@@ -119,12 +113,10 @@ def process_single_fault(args):
             
             assignment = set(solver.get_model())
         
-        # Get inputs in the cone
         cone_inputs = miter.get_cone_inputs(complete_cone)
         if not cone_inputs:
             return None
         
-        # Identify critical inputs
         critical_inputs = identify_critical_inputs_adaptive(
             clauses, assignment, cone_inputs, miter.var_map
         )
@@ -132,16 +124,15 @@ def process_single_fault(args):
         if len(critical_inputs) < 1:
             return None
         
-        # Get graph data
         extractor = VectorizedGraphExtractor(bench_file, var_map=miter.var_map, device='cpu')
         data = extractor.get_data_for_fault(fault_name, fault_type=fault_type)
         
-        # CRITICAL FIX: Convert to plain Python dict instead of returning PyTorch Data
+        # Return plain Python dict (no PyTorch pickling issues)
         result = {
-            'node_names': list(data.node_names),  # List of strings
-            'x': data.x.cpu().numpy(),  # Convert to numpy array
-            'edge_index': data.edge_index.cpu().numpy(),  # Convert to numpy
-            'critical_inputs': critical_inputs,  # Already a dict
+            'node_names': list(data.node_names),
+            'x': data.x.cpu().numpy(),
+            'edge_index': data.edge_index.cpu().numpy(),
+            'critical_inputs': critical_inputs,
             'fault_name': fault_name,
             'fault_type': fault_type,
             'num_critical_inputs': len(critical_inputs)
@@ -149,22 +140,15 @@ def process_single_fault(args):
         
         return result
         
-    except Exception as e:
-        # Silently skip problematic faults
+    except:
         return None
 
 
 def dict_to_data(result_dict):
-    """
-    Convert plain Python dict back to PyTorch Data object.
-    
-    This is done in the main process, not in workers, so no pickling issues.
-    """
-    # Convert numpy arrays back to tensors
+    """Convert plain Python dict back to PyTorch Data object"""
     x = torch.from_numpy(result_dict['x']).float()
     edge_index = torch.from_numpy(result_dict['edge_index']).long()
     
-    # Create labels
     node_names = result_dict['node_names']
     critical_inputs = result_dict['critical_inputs']
     
@@ -178,7 +162,6 @@ def dict_to_data(result_dict):
             train_mask[k] = 1.0
             importance[k] = 1.0
     
-    # Create Data object
     data = Data(x=x, edge_index=edge_index)
     data.node_names = node_names
     data.y_polarity = y_polarity
@@ -191,10 +174,49 @@ def dict_to_data(result_dict):
     return data
 
 
-def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interval=100):
-    """Generate dataset with PyTorch pickling fix and incremental saving"""
+def sample_faults(all_gates, sample_size, seed=42):
+    """
+    Randomly sample faults from a circuit.
     
-    # Parse circuit once
+    Args:
+        all_gates: List of gate names
+        sample_size: Number of faults to sample (not gates!)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        List of (gate_name, fault_type) tuples
+    """
+    random.seed(seed)
+    
+    # Generate all possible faults
+    all_faults = []
+    for gate in all_gates:
+        all_faults.append((gate, 0))  # SA0
+        all_faults.append((gate, 1))  # SA1
+    
+    # Sample randomly
+    if len(all_faults) <= sample_size:
+        # If requested more than available, return all
+        return all_faults
+    
+    return random.sample(all_faults, sample_size)
+
+
+def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interval=100, 
+                              max_faults=None, seed=42):
+    """
+    Generate dataset with optional random fault sampling.
+    
+    Args:
+        bench_file: Path to circuit file
+        output_dir: Output directory
+        num_workers: Number of parallel workers
+        save_interval: Save checkpoint every N samples
+        max_faults: If specified, randomly sample this many faults. If None, process all.
+        seed: Random seed for fault sampling
+    """
+    
+    # Parse circuit
     if bench_file.endswith('.bench'):
         parser = BenchParser(bench_file)
     else:
@@ -202,11 +224,17 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
     
     all_gates = list(parser.gate_dict.keys())
     
-    # Generate fault list
-    fault_list = []
-    for gate in all_gates:
-        fault_list.append((bench_file, gate, 0))
-        fault_list.append((bench_file, gate, 1))
+    # Generate fault list (with optional sampling)
+    if max_faults is not None:
+        print(f"Randomly sampling {max_faults} faults from {len(all_gates)*2} total faults (seed={seed})")
+        sampled_faults = sample_faults(all_gates, max_faults, seed)
+        fault_list = [(bench_file, gate, ftype) for gate, ftype in sampled_faults]
+    else:
+        print(f"Processing ALL {len(all_gates)*2} faults")
+        fault_list = []
+        for gate in all_gates:
+            fault_list.append((bench_file, gate, 0))
+            fault_list.append((bench_file, gate, 1))
     
     print(f"Processing {len(fault_list)} faults using {num_workers} workers (ROBUST ADAPTIVE mode)...")
     
@@ -231,28 +259,24 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
     processed_count = 0
     last_save_count = len(dataset)
     
-    # Use smaller chunksize to avoid deadlock
+    # Process faults
     with Pool(num_workers) as pool:
         async_result = pool.imap_unordered(process_single_fault, fault_list, chunksize=1)
         
         for i in range(len(fault_list)):
             try:
-                # Get result with timeout
                 result_dict = async_result.next(timeout=PER_FAULT_TIMEOUT)
                 processed_count += 1
                 
-                # Convert dict to Data object in main process (no pickling!)
                 if result_dict is not None:
                     data = dict_to_data(result_dict)
                     dataset.append(data)
                 
-                # INCREMENTAL SAVE: Save every 100 new samples
+                # Incremental save
                 if len(dataset) - last_save_count >= save_interval:
                     try:
-                        # Save to temp file first
                         with open(temp_save_path, 'wb') as f:
                             pickle.dump(dataset, f)
-                        # Then rename to actual file (atomic operation)
                         os.replace(temp_save_path, save_path)
                         last_save_count = len(dataset)
                         print(f"  → Saved checkpoint: {len(dataset)} samples")
@@ -275,13 +299,12 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                 
             except MPTimeoutError:
                 processed_count += 1
-                print(f"  Warning: Fault {processed_count} timed out after {PER_FAULT_TIMEOUT}s, skipping...")
+                print(f"  Warning: Fault {processed_count} timed out, skipping...")
                 continue
             except StopIteration:
                 break
             except Exception as e:
                 processed_count += 1
-                print(f"  Warning: Error processing fault {processed_count}: {e}")
                 continue
     
     print(f"\nDataset generation complete!")
@@ -294,7 +317,6 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
             pickle.dump(dataset, f)
         print(f"Saved final dataset to {save_path}")
         
-        # Clean up temp file if it exists
         if os.path.exists(temp_save_path):
             os.remove(temp_save_path)
     except Exception as e:
@@ -311,8 +333,8 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
     return dataset
 
 
-def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
-    """Generate dataset for all circuits in folder"""
+def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, max_faults_per_circuit=None, seed=42):
+    """Generate dataset for all circuits in folder with optional sampling"""
     from pathlib import Path
     
     bench_folder = Path(bench_folder)
@@ -323,6 +345,8 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
         return 0
     
     print(f"Found {len(bench_files)} circuits in {bench_folder}")
+    if max_faults_per_circuit:
+        print(f"Will sample {max_faults_per_circuit} random faults per circuit (seed={seed})")
     bench_files = sorted(bench_files)
     
     total_samples = 0
@@ -336,7 +360,10 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
         circuit_start = time.time()
         
         try:
-            dataset = generate_dataset_parallel(str(bench_file), output_dir, num_workers)
+            dataset = generate_dataset_parallel(
+                str(bench_file), output_dir, num_workers, 
+                save_interval=100, max_faults=max_faults_per_circuit, seed=seed
+            )
             circuit_time = time.time() - circuit_start
             
             total_samples += len(dataset)
@@ -345,7 +372,6 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
             print(f"Error processing {bench_file.name}: {e}")
             import traceback
             traceback.print_exc()
-            print(f"Continuing to next circuit...")
             continue
     
     total_time = time.time() - start_time
@@ -356,7 +382,6 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4):
     print(f"Total circuits processed: {len(bench_files)}")
     print(f"Total samples generated: {total_samples}")
     print(f"Total time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
-    print(f"Average per circuit: {total_time/len(bench_files):.1f}s")
     
     return total_samples
 
@@ -365,9 +390,9 @@ if __name__ == "__main__":
     import argparse
     from pathlib import Path
     
-    parser = argparse.ArgumentParser(description='Generate training data (FIXED multiprocessing)')
+    parser = argparse.ArgumentParser(description='Generate training data with random fault sampling')
     parser.add_argument('--bench', type=str, required=True,
-                       help='Path to .bench/.v file or folder containing them')
+                       help='Path to .bench/.v file or folder')
     parser.add_argument('--output', type=str, default='./training_data_critical',
                        help='Output directory')
     parser.add_argument('--workers', type=int, default=4,
@@ -376,18 +401,27 @@ if __name__ == "__main__":
                        help='Timeout per fault in seconds')
     parser.add_argument('--save_interval', type=int, default=100,
                        help='Save checkpoint every N samples')
+    parser.add_argument('--max_faults', type=int, default=None,
+                       help='Maximum faults to sample per circuit (None = all faults)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for fault sampling')
     
     args = parser.parse_args()
     
-    # Update global timeout
     PER_FAULT_TIMEOUT = args.timeout
     
     bench_path = Path(args.bench)
     
     if bench_path.is_dir():
-        generate_dataset_for_folder(args.bench, args.output, args.workers)
+        generate_dataset_for_folder(
+            args.bench, args.output, args.workers, 
+            max_faults_per_circuit=args.max_faults, seed=args.seed
+        )
     elif bench_path.is_file():
-        generate_dataset_parallel(args.bench, args.output, args.workers, args.save_interval)
+        generate_dataset_parallel(
+            args.bench, args.output, args.workers, args.save_interval,
+            max_faults=args.max_faults, seed=args.seed
+        )
     else:
         print(f"Error: {args.bench} is not a valid file or directory")
         exit(1)
