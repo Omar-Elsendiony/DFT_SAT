@@ -1,3 +1,5 @@
+
+===== BenchParser.py =====
 """
 Shared Bench File Parser for DFT Analysis
 
@@ -183,7 +185,9 @@ class BenchParser:
         return (f"BenchParser({self.bench_file})\n"
                 f"  PIs: {len(self.inputs)}, POs: {len(self.outputs)}\n"
                 f"  PPIs: {len(self.ppis)}, PPOs: {len(self.ppos)}\n"
-                f"  Gates: {len(self.gates)}, DFFs: {len(self.dffs)}")"""
+                f"  Gates: {len(self.gates)}, DFFs: {len(self.dffs)}")
+===== UnifiedParser.py =====
+"""
 Unified Circuit Parser
 
 Auto-detects file format (.bench or .v) and uses appropriate parser.
@@ -264,7 +268,9 @@ if __name__ == "__main__":
         print(f"Outputs: {parser.outputs}")
         print(f"Gate count: {len(parser.gates)}")
         var_map = parser.build_var_map()
-        print(f"Variables: {len(var_map)}")r"""
+        print(f"Variables: {len(var_map)}")
+===== VerilogParser.py =====
+r"""
 VerilogParser - Enhanced for Yosys Output (FIXED: Consistent Wire Ordering)
 
 CRITICAL FIX:
@@ -569,7 +575,9 @@ class VerilogParser:
         return (f"VerilogParser({self.verilog_file})\n"
                 f"  PIs: {len(self.inputs)}, POs: {len(self.outputs)}\n"
                 f"  PPIs: {len(self.ppis)}, PPOs: {len(self.ppos)}\n"
-                f"  Gates: {len(self.gates)}, DFFs: {len(self.dffs)}")"""
+                f"  Gates: {len(self.gates)}, DFFs: {len(self.dffs)}")
+===== WireFaultMiter.py =====
+"""
 WireFaultMiter with Complete ATPG Cone Extraction
 
 Includes proper handling of:
@@ -883,7 +891,9 @@ class WireFaultMiter:
         else:
             if len(inputs) > 0:
                 clauses.append([-out, inputs[0]])
-                clauses.append([out, -inputs[0]])"""
+                clauses.append([out, -inputs[0]])
+===== benchmark_2.py =====
+"""
 Benchmark Script with FLEXIBLE SAMPLING OPTIONS
 
 Supports:
@@ -1291,7 +1301,9 @@ if __name__ == "__main__":
     MODEL_PATH = args.model
     RESULTS_PATH = args.output
     
-    run_benchmark()"""
+    run_benchmark()
+===== data_generation_hybrid_2.py =====
+"""
 Data generation with RANDOM FAULT SAMPLING
 
 Features:
@@ -1717,7 +1729,9 @@ if __name__ == "__main__":
         )
     else:
         print(f"Error: {args.bench} is not a valid file or directory")
-        exit(1)"""
+        exit(1)
+===== demonstrate_cone.py =====
+"""
 Demonstration: Old vs New Cone Extraction
 Shows the difference between incomplete and complete cone extraction
 """
@@ -1968,7 +1982,9 @@ def compare_methods():
 """)
 
 if __name__ == "__main__":
-    compare_methods()#!/usr/bin/env python3
+    compare_methods()
+===== flatten_verilog.py =====
+#!/usr/bin/env python3
 """
 Recursive Verilog Gate-Level Netlist Generator (IMPROVED)
 
@@ -2294,7 +2310,9 @@ Output will contain actual gate instances like:
 
 
 if __name__ == "__main__":
-    main()"""
+    main()
+===== main.py =====
+"""
 Main Pipeline for GNN-Guided SAT Solving
 
 Usage:
@@ -2361,7 +2379,9 @@ def main():
         print_usage()
 
 if __name__ == "__main__":
-    main()import torch
+    main()
+===== neuro_utils.py =====
+import torch
 import math
 from torch_geometric.data import Data
 from BenchParser import BenchParser
@@ -2597,7 +2617,9 @@ class VectorizedGraphExtractor:
                 x[mask_visited, 11] = 1.0 - (dist[mask_visited] / max_d)
         
         x = torch.cat([x, target_feat], dim=1)
-        return Data(x=x, edge_index=self.edge_index, node_names=self.ordered_names)"""
+        return Data(x=x, edge_index=self.edge_index, node_names=self.ordered_names)
+===== train_model_2.py =====
+"""
 Complete Model Training Script with Critical Input Support
 ===========================================================
 
@@ -3039,7 +3061,9 @@ if __name__ == "__main__":
     # Train
     model = train_model(args)
     
-    print(f"\nTraining complete! Model saved to {args.save_path}")"""
+    print(f"\nTraining complete! Model saved to {args.save_path}")
+===== validate_parser.py =====
+"""
 Validation Script: Verify Consistent Node Ordering Across Parsers
 
 This script tests that BenchParser and VerilogParser produce IDENTICAL

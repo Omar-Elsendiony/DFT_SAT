@@ -198,12 +198,12 @@ class VectorizedGraphExtractor:
         x = self.x_base.clone()
         tid = self.name_to_idx.get(fault_name)
         
-        # 17th Feature: Target Value
-        target_feat = torch.full((self.num_nodes, 1), 0.5, device=self.device)
+        # FIX 1: Broadcast the target fault value GLOBALLY
+        fault_val = 0.0 if fault_type == 1 else 1.0
+        target_feat = torch.full((self.num_nodes, 1), fault_val, device=self.device)
         
         if tid is not None:
             x[tid, 10] = 1.0  # Fault location marker
-            target_feat[tid] = 0.0 if fault_type == 1 else 1.0
             
             # BFS Distance
             dist = torch.full((self.num_nodes,), -1.0, device=self.device)
@@ -234,4 +234,8 @@ class VectorizedGraphExtractor:
                 x[mask_visited, 11] = 1.0 - (dist[mask_visited] / max_d)
         
         x = torch.cat([x, target_feat], dim=1)
-        return Data(x=x, edge_index=self.edge_index, node_names=self.ordered_names)
+        
+        # FIX 2: Create undirected edges ONLY for the GNN inference data
+        undirected_edge_index = torch.cat([self.edge_index, self.edge_index.flip(0)], dim=1)
+        
+        return Data(x=x, edge_index=undirected_edge_index, node_names=self.ordered_names)

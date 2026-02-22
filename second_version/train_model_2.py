@@ -27,12 +27,13 @@ class CircuitGNN_Polarity(torch.nn.Module):
     GNN for predicting input polarities in circuit ATPG.
     
     Optimized for critical input learning with:
-    - Deeper architecture (12 layers)
+    - Shallower architecture (5 layers) to prevent oversmoothing
     - Residual connections
+    - Jumping Knowledge (concatenating all layers)
     - Better normalization
     """
     
-    def __init__(self, num_node_features=17, num_layers=12, hidden_dim=64, dropout=0.1):
+    def __init__(self, num_node_features=17, num_layers=5, hidden_dim=64, dropout=0.1):
         super().__init__()
         
         self.num_layers = num_layers
@@ -55,12 +56,14 @@ class CircuitGNN_Polarity(torch.nn.Module):
             )
             self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
         
-        # Output head
+        # Output head with Jumping Knowledge 
+        # (hidden_dim for original proj + hidden_dim for each layer)
+        jk_dim = hidden_dim * (num_layers + 1)
         self.output_head = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
+            nn.Linear(jk_dim, 64),
             nn.ELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 1)
+            nn.Linear(64, 1)
         )
     
     def forward(self, data):
@@ -68,6 +71,9 @@ class CircuitGNN_Polarity(torch.nn.Module):
         
         # Input projection
         x = self.input_proj(x)
+        
+        # Store layer outputs for Jumping Knowledge
+        xs = [x]
         
         # GNN layers with residual connections
         for i in range(self.num_layers):
@@ -77,10 +83,14 @@ class CircuitGNN_Polarity(torch.nn.Module):
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
             x = x + identity  # Residual connection
+            xs.append(x)
+        
+        # Concatenate original projection + all GAT layers
+        x_jk = torch.cat(xs, dim=1) 
         
         # Output
-        x = self.output_head(x)
-        return torch.sigmoid(x)
+        x_out = self.output_head(x_jk)
+        return torch.sigmoid(x_out)
 
 
 # ============================================================================
@@ -390,45 +400,45 @@ if __name__ == "__main__":
     
     # Data
     parser.add_argument('--data_dir', type=str, required=True,
-                       help='Directory containing training data (.pkl files)')
+                        help='Directory containing training data (.pkl files)')
     parser.add_argument('--train_ratio', type=float, default=0.8,
-                       help='Fraction of data for training')
+                        help='Fraction of data for training')
     parser.add_argument('--val_ratio', type=float, default=0.1,
-                       help='Fraction of data for validation')
+                        help='Fraction of data for validation')
     
     # Model
-    parser.add_argument('--num_layers', type=int, default=12,
-                       help='Number of GNN layers')
+    parser.add_argument('--num_layers', type=int, default=5, # Changed from 12 to 5
+                        help='Number of GNN layers')
     parser.add_argument('--hidden_dim', type=int, default=64,
-                       help='Hidden dimension size')
+                        help='Hidden dimension size')
     parser.add_argument('--dropout', type=float, default=0.1,
-                       help='Dropout rate')
+                        help='Dropout rate')
     
     # Training
     parser.add_argument('--epochs', type=int, default=3,
-                       help='Maximum number of epochs')
+                        help='Maximum number of epochs')
     parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size')
+                        help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001,
-                       help='Learning rate')
+                        help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay')
+                        help='Weight decay')
     parser.add_argument('--patience', type=int, default=30,
-                       help='Early stopping patience')
+                        help='Early stopping patience')
     
     # Loss function
     parser.add_argument('--use_focal', action='store_true',
-                       help='Use focal loss instead of BCE')
+                        help='Use focal loss instead of BCE')
     parser.add_argument('--focal_alpha', type=float, default=0.25,
-                       help='Focal loss alpha parameter')
+                        help='Focal loss alpha parameter')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
-                       help='Focal loss gamma parameter')
+                        help='Focal loss gamma parameter')
     
     # Misc
     parser.add_argument('--save_path', type=str, default='best_model.pt',
-                       help='Path to save best model')
+                        help='Path to save best model')
     parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
+                        help='Random seed')
     
     args = parser.parse_args()
     
