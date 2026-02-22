@@ -338,7 +338,7 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, max_fau
     from pathlib import Path
     
     bench_folder = Path(bench_folder)
-    bench_files = list(bench_folder.glob('*.bench')) + list(bench_folder.glob('*.v'))
+    bench_files = list(bench_folder.rglob('*.bench')) + list(bench_folder.rglob('*.v'))
     
     if not bench_files:
         print(f"No .bench or .v files found in {bench_folder}")
