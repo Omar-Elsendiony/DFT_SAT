@@ -412,7 +412,7 @@ if __name__ == "__main__":
                        help='Path to .bench/.v file or folder')
     parser.add_argument('--output', type=str, default='./training_data_critical',
                        help='Output directory')
-    parser.add_argument('--workers', type=int, default=4,
+    parser.add_argument('--workers', type=int, default=6,
                        help='Number of parallel workers')
     parser.add_argument('--timeout', type=int, default=30,
                        help='Timeout per fault in seconds')
