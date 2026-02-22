@@ -175,7 +175,8 @@ def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_t
     
     # GNN-guided
     t_gnn_start = time.time()
-    
+    complete_cone = miter.get_complete_atpg_cone(target_gate, target_output)
+
     data = extractor.get_data_for_fault(target_gate, fault_type=fault_type).to(device)
     
     with torch.no_grad():
@@ -184,9 +185,9 @@ def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_t
     # === NEW: TOP-K HINT SELECTION ===
     # Instead of static thresholds, we collect all probabilities and sort them by confidence
     predictions = []
-    
+    cone_inputs = miter.get_cone_inputs(complete_cone)
     for idx, name in enumerate(data.node_names):
-        if name in miter.inputs:
+        if name in cone_inputs:
             prob = pol_scores[idx].item()
             var_id = miter.var_map.get(name)
             
