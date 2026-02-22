@@ -641,68 +641,50 @@ class WireFaultMiter:
 
     def get_complete_atpg_cone(self, gate_name, target_output):
         """
-        Extract the COMPLETE ATPG cone including side inputs.
-        
-        This includes:
-        1. Activation cone: inputs → fault (fan-in)
-        2. Propagation cone: fault → output (fan-out path)
-        3. Side input cones: other logic affecting propagation gates ⭐
-        
-        Args:
-            gate_name: Fault site
-            target_output: Target primary output (used to limit scope)
-            
-        Returns:
-            Complete ATPG cone as list of (output, gate_type, inputs) tuples
+        Extract the PERFECT ATPG cone using Forward/Backward intersection.
         """
-        # Step 1: Trace the propagation path (fault → target output)
-        propagation_path = set()
-        visited_prop = set()
+        # Step 1: Backward reachability from target_output
+        backward_visited = set()
+        def dfs_back(node):
+            if node in backward_visited: return
+            backward_visited.add(node)
+            if node in self.parser.gate_dict:
+                _, inputs = self.parser.gate_dict[node]
+                for inp in inputs:
+                    dfs_back(inp)
+        dfs_back(target_output)
+
+        # Step 2: Forward reachability from fault site
+        forward_visited = set()
+        def dfs_forward(node):
+            if node in forward_visited: return
+            forward_visited.add(node)
+            for next_gate in self.parser.get_fanout(node):
+                dfs_forward(next_gate)
+        dfs_forward(gate_name)
+
+        # Step 3: The strict propagation path is the intersection!
+        # This completely eliminates dead-end branches.
+        propagation_path = forward_visited.intersection(backward_visited)
         
-        def trace_propagation(node, target):
-            """Find all gates on path from fault to specific output"""
-            if node in visited_prop:
-                return
-            visited_prop.add(node)
-            
-            # Stop if we reached the target
-            if node == target:
-                return
-            
-            # Add to path if it's a gate (not the fault itself yet)
-            if node != gate_name and node in self.parser.gate_dict:
-                propagation_path.add(node)
-            
-            # Continue tracing only if we haven't reached target
-            if node != target:
-                fanout = self.parser.get_fanout(node)
-                for next_gate in fanout:
-                    if next_gate not in visited_prop:
-                        trace_propagation(next_gate, target)
-        
-        trace_propagation(gate_name, target_output)
-        
-        # Step 2: For EACH propagation gate, get its COMPLETE fan-in
-        # This captures side inputs! ⭐
+        # Step 4: Get side-inputs for the STRICT propagation path
         side_logic = set()
         propagation_cone = []
         
         for prop_gate in propagation_path:
-            # Add the propagation gate itself
             if prop_gate in self.parser.gate_dict:
                 g_type, inputs = self.parser.gate_dict[prop_gate]
                 propagation_cone.append((prop_gate, g_type, inputs))
                 
                 # Get ALL logic feeding this propagation gate
-                # (excluding the fault gate to avoid double-counting)
                 gate_fanin = self._get_fanin_recursive(prop_gate, stop_at=gate_name)
                 for fanin_gate, _, _ in gate_fanin:
                     side_logic.add(fanin_gate)
         
-        # Step 3: Get fault activation cone (fan-in to fault)
+        # Step 5: Get fault activation cone
         activation_cone = self._get_fanin_recursive(gate_name, stop_at=None)
         
-        # Step 4: Build side input cone (gates in side_logic but not activation)
+        # Step 6: Build side input cone (excluding activation gates)
         side_cone = []
         activation_gates = set([g[0] for g in activation_cone])
         
@@ -711,13 +693,13 @@ class WireFaultMiter:
                 g_type, inputs = self.parser.gate_dict[gate]
                 side_cone.append((gate, g_type, inputs))
         
-        # Step 5: Add the fault gate itself
+        # Step 7: Add fault gate itself
         fault_gate = []
         if gate_name in self.parser.gate_dict:
             g_type, inputs = self.parser.gate_dict[gate_name]
             fault_gate = [(gate_name, g_type, inputs)]
-        
-        # Step 6: Combine all components and deduplicate
+            
+        # Combine and deduplicate
         all_gates = activation_cone + fault_gate + side_cone + propagation_cone
         seen = set()
         complete_cone = []
@@ -726,8 +708,81 @@ class WireFaultMiter:
             if gate[0] not in seen:
                 seen.add(gate[0])
                 complete_cone.append(gate)
-        
+                
         return complete_cone
+
+
+    def build_miter(self, fault_wire, fault_type=None, force_diff=1, target_output=None):
+        """Build miter circuit targeting a SPECIFIC output if provided."""
+        clauses = []
+        
+        # 1. Good Circuit
+        for out, g_type, inputs in self.gates:
+            self._add_gate_clauses(clauses, self.var_map[out], g_type, 
+                                  [self.var_map[i] for i in inputs])
+            
+        # 2. Faulty Circuit
+        self.faulty_map = {name: self.var_map[name] for name in self.inputs}
+        for out, _, _ in self.gates:
+            if out not in self.faulty_map:
+                self.faulty_map[out] = self.next_var
+                self.next_var += 1
+                
+        # Inject Fault
+        if fault_wire in self.faulty_map and fault_type is not None:
+            f_var = self.faulty_map[fault_wire]
+            if fault_type == 1: 
+                clauses.append([f_var])
+            elif fault_type == 0: 
+                clauses.append([-f_var])
+
+        for out, g_type, inputs in self.gates:
+            if out == fault_wire: 
+                continue
+            out_var = self.faulty_map[out]
+            in_vars = [self.faulty_map.get(i) for i in inputs]
+            if None in in_vars: 
+                continue 
+            self._add_gate_clauses(clauses, out_var, g_type, in_vars)
+
+        # 3. Miter Comparator
+        miter_out = self.next_var
+        self.next_var += 1
+        diff_vars = []
+        
+        for out in sorted(list(set(self.outputs))):
+            if out not in self.var_map or out not in self.faulty_map: 
+                continue
+                
+            # NEW: If a specific target_output is requested, ignore the rest!
+            if target_output is not None and out != target_output:
+                continue
+                
+            good = self.var_map[out]
+            bad = self.faulty_map[out]
+            diff = self.next_var
+            self.next_var += 1
+            
+            clauses.extend([
+                [-good, -bad, -diff], 
+                [good, bad, -diff], 
+                [-good, bad, diff], 
+                [good, -bad, diff]
+            ])
+            diff_vars.append(diff)
+            
+        # If the fault can't reach the target output, miter is invalid
+        if not diff_vars:
+            return []
+            
+        big_or = [-miter_out]
+        for d in diff_vars:
+            clauses.append([-d, miter_out])
+            big_or.append(d)
+        clauses.append(big_or)
+        clauses.append([miter_out])
+        
+        return clauses
 
     def _get_fanin_recursive(self, gate_name, stop_at=None):
         """
@@ -768,68 +823,68 @@ class WireFaultMiter:
                     cone_inputs.add(inp)
         return cone_inputs
 
-    def build_miter(self, fault_wire, fault_type=None, force_diff=1):
-        """Build miter circuit for fault detection."""
-        clauses = []
+    # def build_miter(self, fault_wire, fault_type=None, force_diff=1):
+    #     """Build miter circuit for fault detection."""
+    #     clauses = []
         
-        # 1. Good Circuit
-        for out, g_type, inputs in self.gates:
-            self._add_gate_clauses(clauses, self.var_map[out], g_type, 
-                                  [self.var_map[i] for i in inputs])
+    #     # 1. Good Circuit
+    #     for out, g_type, inputs in self.gates:
+    #         self._add_gate_clauses(clauses, self.var_map[out], g_type, 
+    #                               [self.var_map[i] for i in inputs])
             
-        # 2. Faulty Circuit
-        self.faulty_map = {name: self.var_map[name] for name in self.inputs}
-        for out, _, _ in self.gates:
-            if out not in self.faulty_map:
-                self.faulty_map[out] = self.next_var
-                self.next_var += 1
+    #     # 2. Faulty Circuit
+    #     self.faulty_map = {name: self.var_map[name] for name in self.inputs}
+    #     for out, _, _ in self.gates:
+    #         if out not in self.faulty_map:
+    #             self.faulty_map[out] = self.next_var
+    #             self.next_var += 1
                 
-        # Inject Fault
-        if fault_wire in self.faulty_map and fault_type is not None:
-            f_var = self.faulty_map[fault_wire]
-            if fault_type == 1: 
-                clauses.append([f_var])
-            elif fault_type == 0: 
-                clauses.append([-f_var])
+    #     # Inject Fault
+    #     if fault_wire in self.faulty_map and fault_type is not None:
+    #         f_var = self.faulty_map[fault_wire]
+    #         if fault_type == 1: 
+    #             clauses.append([f_var])
+    #         elif fault_type == 0: 
+    #             clauses.append([-f_var])
 
-        for out, g_type, inputs in self.gates:
-            if out == fault_wire: 
-                continue
-            out_var = self.faulty_map[out]
-            in_vars = [self.faulty_map.get(i) for i in inputs]
-            if None in in_vars: 
-                continue 
-            self._add_gate_clauses(clauses, out_var, g_type, in_vars)
+    #     for out, g_type, inputs in self.gates:
+    #         if out == fault_wire: 
+    #             continue
+    #         out_var = self.faulty_map[out]
+    #         in_vars = [self.faulty_map.get(i) for i in inputs]
+    #         if None in in_vars: 
+    #             continue 
+    #         self._add_gate_clauses(clauses, out_var, g_type, in_vars)
 
-        # 3. Miter Comparator
-        miter_out = self.next_var
-        self.next_var += 1
-        diff_vars = []
+    #     # 3. Miter Comparator
+    #     miter_out = self.next_var
+    #     self.next_var += 1
+    #     diff_vars = []
         
-        for out in sorted(list(set(self.outputs))):
-            if out not in self.var_map or out not in self.faulty_map: 
-                continue
-            good = self.var_map[out]
-            bad = self.faulty_map[out]
-            diff = self.next_var
-            self.next_var += 1
+    #     for out in sorted(list(set(self.outputs))):
+    #         if out not in self.var_map or out not in self.faulty_map: 
+    #             continue
+    #         good = self.var_map[out]
+    #         bad = self.faulty_map[out]
+    #         diff = self.next_var
+    #         self.next_var += 1
             
-            clauses.extend([
-                [-good, -bad, -diff], 
-                [good, bad, -diff], 
-                [-good, bad, diff], 
-                [good, -bad, diff]
-            ])
-            diff_vars.append(diff)
+    #         clauses.extend([
+    #             [-good, -bad, -diff], 
+    #             [good, bad, -diff], 
+    #             [-good, bad, diff], 
+    #             [good, -bad, diff]
+    #         ])
+    #         diff_vars.append(diff)
             
-        big_or = [-miter_out]
-        for d in diff_vars:
-            clauses.append([-d, miter_out])
-            big_or.append(d)
-        clauses.append(big_or)
-        clauses.append([miter_out])
+    #     big_or = [-miter_out]
+    #     for d in diff_vars:
+    #         clauses.append([-d, miter_out])
+    #         big_or.append(d)
+    #     clauses.append(big_or)
+    #     clauses.append([miter_out])
         
-        return clauses
+    #     return clauses
 
     def _add_gate_clauses(self, clauses, out, g_type, inputs):
         """Add CNF clauses for a gate."""
@@ -1049,10 +1104,13 @@ def get_fault_sample(all_gates, mode, sample_size, seed=42):
 
 def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_type):
     """Benchmark a single fault"""
-    clauses = miter.build_miter(target_gate, fault_type, force_diff=1)
-    
-    if not clauses:
-        return None
+    reachable = miter.get_reachable_outputs(target_gate)
+    if not reachable: return None
+    target_output = reachable[0]
+
+    # Pass the target output to the miter
+    clauses = miter.build_miter(target_gate, fault_type, force_diff=1, target_output=target_output)
+    if not clauses: return None
     
     # Baseline
     t_std_start = time.time()
@@ -1323,13 +1381,13 @@ if __name__ == "__main__":
     run_benchmark()
 ===== data_generation_hybrid_2.py =====
 """
-Data generation with All-SAT Critical Input Extraction
+Data generation with RANDOM FAULT SAMPLING
 
 Features:
 - Sample N random faults per circuit instead of processing all
 - Incremental saving every 100 samples
-- Resolves "Don't Cares" by exploring multiple valid test patterns
-- Completely maps the ATPG cone (no early stopping)
+- Resume from checkpoint
+- No PyTorch pickling issues
 """
 
 from pysat.solvers import Glucose3, Minisat22
@@ -1349,75 +1407,59 @@ from WireFaultMiter import WireFaultMiter
 from neuro_utils import VectorizedGraphExtractor
 
 CONFLICT_BUDGET = 10000
-CRITICAL_INPUT_TEST_BUDGET = 50  # Slightly higher to ensure accuracy
+CRITICAL_INPUT_TEST_BUDGET = 20
 PER_FAULT_TIMEOUT = 300
 
 
-def identify_all_sat_critical_inputs(clauses, cone_inputs, var_map, all_inputs, max_patterns=3):
-    """
-    Finds critical inputs across MULTIPLE valid test patterns.
-    Resolves 'Don't Care' ambiguities and maps the entire cone.
-    """
-    aggregated_critical = {}
+def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map):
+    """ADAPTIVE critical input identification"""
+    critical_inputs = {}
     
     if not cone_inputs:
-        return {}
-        
-    with Glucose3(bootstrap_with=clauses) as solver:
-        for pattern_idx in range(max_patterns):
-            solver.conf_budget(CONFLICT_BUDGET)
-            if not solver.solve():
-                break  # No more valid patterns exist
+        return critical_inputs
+    
+    test_inputs = []
+    for inp in cone_inputs:
+        if inp not in var_map:
+            continue
+        var_id = var_map[inp]
+        correct_polarity = var_id in assignment
+        test_literal = -var_id if correct_polarity else var_id
+        test_inputs.append((inp, var_id, correct_polarity, test_literal))
+    
+    if not test_inputs:
+        return critical_inputs
+    
+    random.shuffle(test_inputs)
+    
+    try:
+        with Glucose3(bootstrap_with=clauses) as probe:
+            tested_count = 0
+            tests_since_last_critical = 0
+            
+            for inp, var_id, correct_polarity, test_literal in test_inputs:
+                probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
                 
-            assignment = set(solver.get_model())
-            
-            # Check criticality for this specific assignment
-            test_inputs = []
-            for inp in cone_inputs:
-                if inp not in var_map: 
-                    continue
-                var_id = var_map[inp]
-                correct_polarity = var_id in assignment
-                test_literal = -var_id if correct_polarity else var_id
-                test_inputs.append((inp, correct_polarity, test_literal))
-            
-            # Use a fresh probe to test if flipping the input breaks the detection
-            with Glucose3(bootstrap_with=clauses) as probe:
-                for inp, correct_polarity, test_literal in test_inputs:
-                    probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
-                    
-                    # If forcing the opposite polarity is UNSAT, this input is strictly required
-                    if not probe.solve(assumptions=[test_literal]):
-                        val = 1.0 if correct_polarity else 0.0
-                        if inp not in aggregated_critical:
-                            aggregated_critical[inp] = set()
-                        aggregated_critical[inp].add(val)
-                        
-            # Add a blocking clause to force the solver to find a completely different test pattern
-            pi_blocking_clause = []
-            for pi in all_inputs:
-                if pi in var_map:
-                    var_id = var_map[pi]
-                    if var_id in assignment:
-                        pi_blocking_clause.append(-var_id)
-                    else:
-                        pi_blocking_clause.append(var_id)
-            
-            if pi_blocking_clause:
-                solver.add_clause(pi_blocking_clause)
-            else:
-                break
+                result = probe.solve(assumptions=[test_literal])
+                tested_count += 1
+                tests_since_last_critical += 1
                 
-    # Resolve global criticality across all patterns
-    final_critical = {}
-    for inp, vals in aggregated_critical.items():
-        if len(vals) == 1: 
-            # It was consistently 1 or consistently 0 across all patterns where it was critical
-            final_critical[inp] = list(vals)[0]
-        # If len(vals) > 1, it required '1' in some paths and '0' in others. 
-        # This is a global 'Don't Care' so we safely skip it.
-        
-    return final_critical
+                if not result:
+                    critical_inputs[inp] = 1.0 if correct_polarity else 0.0
+                    tests_since_last_critical = 0
+                
+                if len(critical_inputs) >= 3 and tests_since_last_critical >= 3:
+                    break
+                
+                if tested_count >= 8 and len(critical_inputs) <= 2:
+                    break
+                
+                if len(critical_inputs) >= 5:
+                    break
+    except:
+        pass
+    
+    return critical_inputs
 
 
 def process_single_fault(args):
@@ -1445,14 +1487,20 @@ def process_single_fault(args):
         
         if not complete_cone:
             return None
+        
+        with Glucose3(bootstrap_with=clauses) as solver:
+            solver.conf_budget(CONFLICT_BUDGET)
+            if not solver.solve():
+                return None
             
+            assignment = set(solver.get_model())
+        
         cone_inputs = miter.get_cone_inputs(complete_cone)
         if not cone_inputs:
             return None
         
-        # Pass all inputs to allow blocking clause generation
-        critical_inputs = identify_all_sat_critical_inputs(
-            clauses, cone_inputs, miter.var_map, miter.inputs, max_patterns=3
+        critical_inputs = identify_critical_inputs_adaptive(
+            clauses, assignment, cone_inputs, miter.var_map
         )
         
         if len(critical_inputs) < 1:
@@ -1511,6 +1559,14 @@ def dict_to_data(result_dict):
 def sample_faults(all_gates, sample_size, seed=42):
     """
     Randomly sample faults from a circuit.
+    
+    Args:
+        all_gates: List of gate names
+        sample_size: Number of faults to sample (not gates!)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        List of (gate_name, fault_type) tuples
     """
     random.seed(seed)
     
@@ -1522,6 +1578,7 @@ def sample_faults(all_gates, sample_size, seed=42):
     
     # Sample randomly
     if len(all_faults) <= sample_size:
+        # If requested more than available, return all
         return all_faults
     
     return random.sample(all_faults, sample_size)
@@ -1531,6 +1588,14 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                               max_faults=None, seed=42):
     """
     Generate dataset with optional random fault sampling.
+    
+    Args:
+        bench_file: Path to circuit file
+        output_dir: Output directory
+        num_workers: Number of parallel workers
+        save_interval: Save checkpoint every N samples
+        max_faults: If specified, randomly sample this many faults. If None, process all.
+        seed: Random seed for fault sampling
     """
     
     # Parse circuit
@@ -1553,7 +1618,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
             fault_list.append((bench_file, gate, 0))
             fault_list.append((bench_file, gate, 1))
     
-    print(f"Processing {len(fault_list)} faults using {num_workers} workers (ALL-SAT mode)...")
+    print(f"Processing {len(fault_list)} faults using {num_workers} workers (ROBUST ADAPTIVE mode)...")
     
     # Setup save paths
     os.makedirs(output_dir, exist_ok=True)
@@ -1596,7 +1661,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                             pickle.dump(dataset, f)
                         os.replace(temp_save_path, save_path)
                         last_save_count = len(dataset)
-                        print(f"  -> Saved checkpoint: {len(dataset)} samples")
+                        print(f"  → Saved checkpoint: {len(dataset)} samples")
                     except Exception as e:
                         print(f"  Warning: Could not save checkpoint: {e}")
                 
@@ -1655,7 +1720,7 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, max_fau
     from pathlib import Path
     
     bench_folder = Path(bench_folder)
-    bench_files = list(bench_folder.rglob('*.bench')) + list(bench_folder.rglob('*.v'))
+    bench_files = list(bench_folder.glob('*.bench')) + list(bench_folder.glob('*.v'))
     
     if not bench_files:
         print(f"No .bench or .v files found in {bench_folder}")

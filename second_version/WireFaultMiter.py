@@ -62,66 +62,119 @@ class WireFaultMiter:
 
     def get_complete_atpg_cone(self, gate_name, target_output):
         """
-        Extract the PERFECT ATPG cone using Forward/Backward intersection.
+        Extract the complete ATPG cone with proper side input handling.
+        
+        Components:
+        1. Activation cone: All logic feeding the fault gate
+        2. Fault gate: The fault gate itself
+        3. Propagation path: Direct path from fault to output
+        4. Side inputs: Other inputs to propagation gates (NOT on main path)
         """
-        # Step 1: Backward reachability from target_output
+        
+        # =========================================================================
+        # STEP 1: Find the DIRECT propagation path (fault -> output)
+        # =========================================================================
+        
+        # Backward from output
         backward_visited = set()
         def dfs_back(node):
-            if node in backward_visited: return
+            if node in backward_visited:
+                return
             backward_visited.add(node)
             if node in self.parser.gate_dict:
                 _, inputs = self.parser.gate_dict[node]
                 for inp in inputs:
                     dfs_back(inp)
+        
         dfs_back(target_output)
-
-        # Step 2: Forward reachability from fault site
+        
+        # Forward from fault
         forward_visited = set()
         def dfs_forward(node):
-            if node in forward_visited: return
+            if node in forward_visited:
+                return
             forward_visited.add(node)
             for next_gate in self.parser.get_fanout(node):
                 dfs_forward(next_gate)
+        
         dfs_forward(gate_name)
-
-        # Step 3: The strict propagation path is the intersection!
-        # This completely eliminates dead-end branches.
+        
+        # Intersection = gates that are both reachable from fault AND reach output
         propagation_path = forward_visited.intersection(backward_visited)
         
-        # Step 4: Get side-inputs for the STRICT propagation path
-        side_logic = set()
-        propagation_cone = []
+        # =========================================================================
+        # STEP 2: Get activation cone (fan-in of fault gate)
+        # =========================================================================
         
-        for prop_gate in propagation_path:
-            if prop_gate in self.parser.gate_dict:
-                g_type, inputs = self.parser.gate_dict[prop_gate]
-                propagation_cone.append((prop_gate, g_type, inputs))
-                
-                # Get ALL logic feeding this propagation gate
-                gate_fanin = self._get_fanin_recursive(prop_gate, stop_at=gate_name)
-                for fanin_gate, _, _ in gate_fanin:
-                    side_logic.add(fanin_gate)
+        activation_cone = []
+        activation_gates = set()
         
-        # Step 5: Get fault activation cone
-        activation_cone = self._get_fanin_recursive(gate_name, stop_at=None)
+        def get_activation(node):
+            if node in activation_gates or node in self.parser.all_inputs:
+                return
+            activation_gates.add(node)
+            
+            if node in self.parser.gate_dict:
+                g_type, inputs = self.parser.gate_dict[node]
+                activation_cone.append((node, g_type, inputs))
+                for inp in inputs:
+                    get_activation(inp)
         
-        # Step 6: Build side input cone (excluding activation gates)
-        side_cone = []
-        activation_gates = set([g[0] for g in activation_cone])
+        # Get fan-in of fault gate (NOT including fault gate itself)
+        if gate_name in self.parser.gate_dict:
+            _, fault_inputs = self.parser.gate_dict[gate_name]
+            for inp in fault_inputs:
+                get_activation(inp)
         
-        for gate in side_logic:
-            if gate not in activation_gates and gate in self.parser.gate_dict:
-                g_type, inputs = self.parser.gate_dict[gate]
-                side_cone.append((gate, g_type, inputs))
+        # =========================================================================
+        # STEP 3: Add fault gate itself
+        # =========================================================================
         
-        # Step 7: Add fault gate itself
         fault_gate = []
         if gate_name in self.parser.gate_dict:
             g_type, inputs = self.parser.gate_dict[gate_name]
             fault_gate = [(gate_name, g_type, inputs)]
+        
+        # =========================================================================
+        # STEP 4: Build propagation cone WITH side inputs
+        # =========================================================================
+        
+        propagation_cone = []
+        side_input_gates = set()
+        
+        for prop_gate in propagation_path:
+            if prop_gate == gate_name:
+                continue  # Already added as fault_gate
             
-        # Combine and deduplicate
-        all_gates = activation_cone + fault_gate + side_cone + propagation_cone
+            if prop_gate in self.parser.gate_dict:
+                g_type, inputs = self.parser.gate_dict[prop_gate]
+                propagation_cone.append((prop_gate, g_type, inputs))
+                
+                # FIX: Side inputs are inputs to this propagation gate
+                # that are NOT themselves on the propagation path
+                for inp in inputs:
+                    if inp not in propagation_path and inp not in activation_gates:
+                        # This is a side input! Get its fan-in cone
+                        def get_side_fanin(node):
+                            if node in side_input_gates or node in activation_gates or node in self.parser.all_inputs:
+                                return
+                            side_input_gates.add(node)
+                            
+                            if node in self.parser.gate_dict:
+                                si_type, si_inputs = self.parser.gate_dict[node]
+                                # Add to propagation cone (since it affects propagation)
+                                propagation_cone.append((node, si_type, si_inputs))
+                                for si_inp in si_inputs:
+                                    get_side_fanin(si_inp)
+                        
+                        get_side_fanin(inp)
+        
+        # =========================================================================
+        # STEP 5: Combine and deduplicate
+        # =========================================================================
+        
+        all_gates = activation_cone + fault_gate + propagation_cone
+        
         seen = set()
         complete_cone = []
         
@@ -129,7 +182,7 @@ class WireFaultMiter:
             if gate[0] not in seen:
                 seen.add(gate[0])
                 complete_cone.append(gate)
-                
+        
         return complete_cone
 
 
