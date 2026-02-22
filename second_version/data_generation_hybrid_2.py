@@ -1,11 +1,11 @@
 """
-Data generation with RANDOM FAULT SAMPLING
+Data generation with All-SAT Critical Input Extraction
 
 Features:
 - Sample N random faults per circuit instead of processing all
 - Incremental saving every 100 samples
-- Resume from checkpoint
-- No PyTorch pickling issues
+- Resolves "Don't Cares" by exploring multiple valid test patterns
+- Completely maps the ATPG cone (no early stopping)
 """
 
 from pysat.solvers import Glucose3, Minisat22
@@ -25,59 +25,75 @@ from WireFaultMiter import WireFaultMiter
 from neuro_utils import VectorizedGraphExtractor
 
 CONFLICT_BUDGET = 10000
-CRITICAL_INPUT_TEST_BUDGET = 20
+CRITICAL_INPUT_TEST_BUDGET = 50  # Slightly higher to ensure accuracy
 PER_FAULT_TIMEOUT = 300
 
 
-def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map):
-    """ADAPTIVE critical input identification"""
-    critical_inputs = {}
+def identify_all_sat_critical_inputs(clauses, cone_inputs, var_map, all_inputs, max_patterns=3):
+    """
+    Finds critical inputs across MULTIPLE valid test patterns.
+    Resolves 'Don't Care' ambiguities and maps the entire cone.
+    """
+    aggregated_critical = {}
     
     if not cone_inputs:
-        return critical_inputs
-    
-    test_inputs = []
-    for inp in cone_inputs:
-        if inp not in var_map:
-            continue
-        var_id = var_map[inp]
-        correct_polarity = var_id in assignment
-        test_literal = -var_id if correct_polarity else var_id
-        test_inputs.append((inp, var_id, correct_polarity, test_literal))
-    
-    if not test_inputs:
-        return critical_inputs
-    
-    random.shuffle(test_inputs)
-    
-    try:
-        with Glucose3(bootstrap_with=clauses) as probe:
-            tested_count = 0
-            tests_since_last_critical = 0
+        return {}
+        
+    with Glucose3(bootstrap_with=clauses) as solver:
+        for pattern_idx in range(max_patterns):
+            solver.conf_budget(CONFLICT_BUDGET)
+            if not solver.solve():
+                break  # No more valid patterns exist
+                
+            assignment = set(solver.get_model())
             
-            for inp, var_id, correct_polarity, test_literal in test_inputs:
-                probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
+            # Check criticality for this specific assignment
+            test_inputs = []
+            for inp in cone_inputs:
+                if inp not in var_map: 
+                    continue
+                var_id = var_map[inp]
+                correct_polarity = var_id in assignment
+                test_literal = -var_id if correct_polarity else var_id
+                test_inputs.append((inp, correct_polarity, test_literal))
+            
+            # Use a fresh probe to test if flipping the input breaks the detection
+            with Glucose3(bootstrap_with=clauses) as probe:
+                for inp, correct_polarity, test_literal in test_inputs:
+                    probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
+                    
+                    # If forcing the opposite polarity is UNSAT, this input is strictly required
+                    if not probe.solve(assumptions=[test_literal]):
+                        val = 1.0 if correct_polarity else 0.0
+                        if inp not in aggregated_critical:
+                            aggregated_critical[inp] = set()
+                        aggregated_critical[inp].add(val)
+                        
+            # Add a blocking clause to force the solver to find a completely different test pattern
+            pi_blocking_clause = []
+            for pi in all_inputs:
+                if pi in var_map:
+                    var_id = var_map[pi]
+                    if var_id in assignment:
+                        pi_blocking_clause.append(-var_id)
+                    else:
+                        pi_blocking_clause.append(var_id)
+            
+            if pi_blocking_clause:
+                solver.add_clause(pi_blocking_clause)
+            else:
+                break
                 
-                result = probe.solve(assumptions=[test_literal])
-                tested_count += 1
-                tests_since_last_critical += 1
-                
-                if not result:
-                    critical_inputs[inp] = 1.0 if correct_polarity else 0.0
-                    tests_since_last_critical = 0
-                
-                if len(critical_inputs) >= 3 and tests_since_last_critical >= 3:
-                    break
-                
-                if tested_count >= 8 and len(critical_inputs) <= 2:
-                    break
-                
-                if len(critical_inputs) >= 5:
-                    break
-    except:
-        pass
-    
-    return critical_inputs
+    # Resolve global criticality across all patterns
+    final_critical = {}
+    for inp, vals in aggregated_critical.items():
+        if len(vals) == 1: 
+            # It was consistently 1 or consistently 0 across all patterns where it was critical
+            final_critical[inp] = list(vals)[0]
+        # If len(vals) > 1, it required '1' in some paths and '0' in others. 
+        # This is a global 'Don't Care' so we safely skip it.
+        
+    return final_critical
 
 
 def process_single_fault(args):
@@ -91,34 +107,31 @@ def process_single_fault(args):
             parser = VerilogParser(bench_file)
         
         miter = WireFaultMiter(bench_file)
-        clauses = miter.build_miter(fault_name, fault_type, force_diff=1)
         
-        if not clauses:
-            return None
-        
+        # 1. Get target output first!
         reachable = miter.get_reachable_outputs(fault_name)
         if not reachable:
             return None
-        
         target_output = reachable[0]
+        
+        # 2. Build the miter SPECIFICALLY for that output
+        clauses = miter.build_miter(fault_name, fault_type, force_diff=1, target_output=target_output)
+        if not clauses:
+            return None
+            
+        # 3. Get the complete cone
         complete_cone = miter.get_complete_atpg_cone(fault_name, target_output)
         
         if not complete_cone:
             return None
-        
-        with Glucose3(bootstrap_with=clauses) as solver:
-            solver.conf_budget(CONFLICT_BUDGET)
-            if not solver.solve():
-                return None
             
-            assignment = set(solver.get_model())
-        
         cone_inputs = miter.get_cone_inputs(complete_cone)
         if not cone_inputs:
             return None
         
-        critical_inputs = identify_critical_inputs_adaptive(
-            clauses, assignment, cone_inputs, miter.var_map
+        # Pass all inputs to allow blocking clause generation
+        critical_inputs = identify_all_sat_critical_inputs(
+            clauses, cone_inputs, miter.var_map, miter.inputs, max_patterns=3
         )
         
         if len(critical_inputs) < 1:
@@ -177,14 +190,6 @@ def dict_to_data(result_dict):
 def sample_faults(all_gates, sample_size, seed=42):
     """
     Randomly sample faults from a circuit.
-    
-    Args:
-        all_gates: List of gate names
-        sample_size: Number of faults to sample (not gates!)
-        seed: Random seed for reproducibility
-    
-    Returns:
-        List of (gate_name, fault_type) tuples
     """
     random.seed(seed)
     
@@ -196,7 +201,6 @@ def sample_faults(all_gates, sample_size, seed=42):
     
     # Sample randomly
     if len(all_faults) <= sample_size:
-        # If requested more than available, return all
         return all_faults
     
     return random.sample(all_faults, sample_size)
@@ -206,14 +210,6 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                               max_faults=None, seed=42):
     """
     Generate dataset with optional random fault sampling.
-    
-    Args:
-        bench_file: Path to circuit file
-        output_dir: Output directory
-        num_workers: Number of parallel workers
-        save_interval: Save checkpoint every N samples
-        max_faults: If specified, randomly sample this many faults. If None, process all.
-        seed: Random seed for fault sampling
     """
     
     # Parse circuit
@@ -236,7 +232,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
             fault_list.append((bench_file, gate, 0))
             fault_list.append((bench_file, gate, 1))
     
-    print(f"Processing {len(fault_list)} faults using {num_workers} workers (ROBUST ADAPTIVE mode)...")
+    print(f"Processing {len(fault_list)} faults using {num_workers} workers (ALL-SAT mode)...")
     
     # Setup save paths
     os.makedirs(output_dir, exist_ok=True)
@@ -279,7 +275,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                             pickle.dump(dataset, f)
                         os.replace(temp_save_path, save_path)
                         last_save_count = len(dataset)
-                        print(f"  → Saved checkpoint: {len(dataset)} samples")
+                        print(f"  -> Saved checkpoint: {len(dataset)} samples")
                     except Exception as e:
                         print(f"  Warning: Could not save checkpoint: {e}")
                 

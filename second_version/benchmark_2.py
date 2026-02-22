@@ -28,8 +28,8 @@ from train_model_2 import CircuitGNN_Polarity
 BENCHMARK_DIR = "../../hdl-benchmarks/iscas85/bench/"
 MODEL_PATH = "best_model.pt"
 RESULTS_PATH = "results_gnn_polarity.csv"
-CONFIDENCE_HIGH = 0.7
-CONFIDENCE_LOW = 0.3
+CONFIDENCE_HIGH = 0.95
+CONFIDENCE_LOW = 0.05
 
 # SAMPLING OPTIONS
 SAMPLING_MODE = "random"  # Options: "all", "random", "stratified", "first_n"
@@ -154,10 +154,13 @@ def get_fault_sample(all_gates, mode, sample_size, seed=42):
 
 def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_type):
     """Benchmark a single fault"""
-    clauses = miter.build_miter(target_gate, fault_type, force_diff=1)
-    
-    if not clauses:
-        return None
+    reachable = miter.get_reachable_outputs(target_gate)
+    if not reachable: return None
+    target_output = reachable[0]
+
+    # Pass the target output to the miter
+    clauses = miter.build_miter(target_gate, fault_type, force_diff=1, target_output=target_output)
+    if not clauses: return None
     
     # Baseline
     t_std_start = time.time()
@@ -178,10 +181,9 @@ def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_t
     with torch.no_grad():
         pol_scores = model(data)
     
-    hint_literals = []
-    num_hints_high = 0
-    num_hints_low = 0
-    num_uncertain = 0
+    # === NEW: TOP-K HINT SELECTION ===
+    # Instead of static thresholds, we collect all probabilities and sort them by confidence
+    predictions = []
     
     for idx, name in enumerate(data.node_names):
         if name in miter.inputs:
@@ -189,14 +191,34 @@ def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_t
             var_id = miter.var_map.get(name)
             
             if var_id:
-                if prob > CONFIDENCE_HIGH:
-                    hint_literals.append(var_id)
-                    num_hints_high += 1
-                elif prob < CONFIDENCE_LOW:
-                    hint_literals.append(-var_id)
-                    num_hints_low += 1
-                else:
-                    num_uncertain += 1
+                # Confidence is how far the probability is from 0.5
+                confidence = abs(prob - 0.5)
+                is_high = prob > 0.5
+                predictions.append((confidence, var_id, is_high))
+    
+    # Sort by highest confidence first
+    predictions.sort(reverse=True, key=lambda x: x[0])
+    
+    # Take ONLY the top 5 most confident hints
+    MAX_HINTS = 5
+    top_predictions = predictions[:MAX_HINTS]
+    
+    hint_literals = []
+    num_hints_high = 0
+    num_hints_low = 0
+    
+    for confidence, var_id, is_high in top_predictions:
+        # Only take it if it's at least somewhat confident (e.g. >0.75 or <0.25)
+        if confidence > 0.25: 
+            if is_high:
+                hint_literals.append(var_id)
+                num_hints_high += 1
+            else:
+                hint_literals.append(-var_id)
+                num_hints_low += 1
+                
+    num_uncertain = len(miter.inputs) - (num_hints_high + num_hints_low)
+    # ==================================
     
     with Minisat22(bootstrap_with=clauses) as solver:
         solver.conf_budget(100000)

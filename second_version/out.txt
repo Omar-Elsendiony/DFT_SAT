@@ -923,8 +923,8 @@ from train_model_2 import CircuitGNN_Polarity
 BENCHMARK_DIR = "../../hdl-benchmarks/iscas85/bench/"
 MODEL_PATH = "best_model.pt"
 RESULTS_PATH = "results_gnn_polarity.csv"
-CONFIDENCE_HIGH = 0.7
-CONFIDENCE_LOW = 0.3
+CONFIDENCE_HIGH = 0.95
+CONFIDENCE_LOW = 0.05
 
 # SAMPLING OPTIONS
 SAMPLING_MODE = "random"  # Options: "all", "random", "stratified", "first_n"
@@ -1073,10 +1073,9 @@ def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_t
     with torch.no_grad():
         pol_scores = model(data)
     
-    hint_literals = []
-    num_hints_high = 0
-    num_hints_low = 0
-    num_uncertain = 0
+    # === NEW: TOP-K HINT SELECTION ===
+    # Instead of static thresholds, we collect all probabilities and sort them by confidence
+    predictions = []
     
     for idx, name in enumerate(data.node_names):
         if name in miter.inputs:
@@ -1084,14 +1083,34 @@ def benchmark_single_fault(miter, extractor, model, device, target_gate, fault_t
             var_id = miter.var_map.get(name)
             
             if var_id:
-                if prob > CONFIDENCE_HIGH:
-                    hint_literals.append(var_id)
-                    num_hints_high += 1
-                elif prob < CONFIDENCE_LOW:
-                    hint_literals.append(-var_id)
-                    num_hints_low += 1
-                else:
-                    num_uncertain += 1
+                # Confidence is how far the probability is from 0.5
+                confidence = abs(prob - 0.5)
+                is_high = prob > 0.5
+                predictions.append((confidence, var_id, is_high))
+    
+    # Sort by highest confidence first
+    predictions.sort(reverse=True, key=lambda x: x[0])
+    
+    # Take ONLY the top 5 most confident hints
+    MAX_HINTS = 5
+    top_predictions = predictions[:MAX_HINTS]
+    
+    hint_literals = []
+    num_hints_high = 0
+    num_hints_low = 0
+    
+    for confidence, var_id, is_high in top_predictions:
+        # Only take it if it's at least somewhat confident (e.g. >0.75 or <0.25)
+        if confidence > 0.25: 
+            if is_high:
+                hint_literals.append(var_id)
+                num_hints_high += 1
+            else:
+                hint_literals.append(-var_id)
+                num_hints_low += 1
+                
+    num_uncertain = len(miter.inputs) - (num_hints_high + num_hints_low)
+    # ==================================
     
     with Minisat22(bootstrap_with=clauses) as solver:
         solver.conf_budget(100000)
@@ -1304,13 +1323,13 @@ if __name__ == "__main__":
     run_benchmark()
 ===== data_generation_hybrid_2.py =====
 """
-Data generation with RANDOM FAULT SAMPLING
+Data generation with All-SAT Critical Input Extraction
 
 Features:
 - Sample N random faults per circuit instead of processing all
 - Incremental saving every 100 samples
-- Resume from checkpoint
-- No PyTorch pickling issues
+- Resolves "Don't Cares" by exploring multiple valid test patterns
+- Completely maps the ATPG cone (no early stopping)
 """
 
 from pysat.solvers import Glucose3, Minisat22
@@ -1330,59 +1349,75 @@ from WireFaultMiter import WireFaultMiter
 from neuro_utils import VectorizedGraphExtractor
 
 CONFLICT_BUDGET = 10000
-CRITICAL_INPUT_TEST_BUDGET = 20
+CRITICAL_INPUT_TEST_BUDGET = 50  # Slightly higher to ensure accuracy
 PER_FAULT_TIMEOUT = 300
 
 
-def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map):
-    """ADAPTIVE critical input identification"""
-    critical_inputs = {}
+def identify_all_sat_critical_inputs(clauses, cone_inputs, var_map, all_inputs, max_patterns=3):
+    """
+    Finds critical inputs across MULTIPLE valid test patterns.
+    Resolves 'Don't Care' ambiguities and maps the entire cone.
+    """
+    aggregated_critical = {}
     
     if not cone_inputs:
-        return critical_inputs
-    
-    test_inputs = []
-    for inp in cone_inputs:
-        if inp not in var_map:
-            continue
-        var_id = var_map[inp]
-        correct_polarity = var_id in assignment
-        test_literal = -var_id if correct_polarity else var_id
-        test_inputs.append((inp, var_id, correct_polarity, test_literal))
-    
-    if not test_inputs:
-        return critical_inputs
-    
-    random.shuffle(test_inputs)
-    
-    try:
-        with Glucose3(bootstrap_with=clauses) as probe:
-            tested_count = 0
-            tests_since_last_critical = 0
+        return {}
+        
+    with Glucose3(bootstrap_with=clauses) as solver:
+        for pattern_idx in range(max_patterns):
+            solver.conf_budget(CONFLICT_BUDGET)
+            if not solver.solve():
+                break  # No more valid patterns exist
+                
+            assignment = set(solver.get_model())
             
-            for inp, var_id, correct_polarity, test_literal in test_inputs:
-                probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
+            # Check criticality for this specific assignment
+            test_inputs = []
+            for inp in cone_inputs:
+                if inp not in var_map: 
+                    continue
+                var_id = var_map[inp]
+                correct_polarity = var_id in assignment
+                test_literal = -var_id if correct_polarity else var_id
+                test_inputs.append((inp, correct_polarity, test_literal))
+            
+            # Use a fresh probe to test if flipping the input breaks the detection
+            with Glucose3(bootstrap_with=clauses) as probe:
+                for inp, correct_polarity, test_literal in test_inputs:
+                    probe.conf_budget(CRITICAL_INPUT_TEST_BUDGET)
+                    
+                    # If forcing the opposite polarity is UNSAT, this input is strictly required
+                    if not probe.solve(assumptions=[test_literal]):
+                        val = 1.0 if correct_polarity else 0.0
+                        if inp not in aggregated_critical:
+                            aggregated_critical[inp] = set()
+                        aggregated_critical[inp].add(val)
+                        
+            # Add a blocking clause to force the solver to find a completely different test pattern
+            pi_blocking_clause = []
+            for pi in all_inputs:
+                if pi in var_map:
+                    var_id = var_map[pi]
+                    if var_id in assignment:
+                        pi_blocking_clause.append(-var_id)
+                    else:
+                        pi_blocking_clause.append(var_id)
+            
+            if pi_blocking_clause:
+                solver.add_clause(pi_blocking_clause)
+            else:
+                break
                 
-                result = probe.solve(assumptions=[test_literal])
-                tested_count += 1
-                tests_since_last_critical += 1
-                
-                if not result:
-                    critical_inputs[inp] = 1.0 if correct_polarity else 0.0
-                    tests_since_last_critical = 0
-                
-                if len(critical_inputs) >= 3 and tests_since_last_critical >= 3:
-                    break
-                
-                if tested_count >= 8 and len(critical_inputs) <= 2:
-                    break
-                
-                if len(critical_inputs) >= 5:
-                    break
-    except:
-        pass
-    
-    return critical_inputs
+    # Resolve global criticality across all patterns
+    final_critical = {}
+    for inp, vals in aggregated_critical.items():
+        if len(vals) == 1: 
+            # It was consistently 1 or consistently 0 across all patterns where it was critical
+            final_critical[inp] = list(vals)[0]
+        # If len(vals) > 1, it required '1' in some paths and '0' in others. 
+        # This is a global 'Don't Care' so we safely skip it.
+        
+    return final_critical
 
 
 def process_single_fault(args):
@@ -1410,20 +1445,14 @@ def process_single_fault(args):
         
         if not complete_cone:
             return None
-        
-        with Glucose3(bootstrap_with=clauses) as solver:
-            solver.conf_budget(CONFLICT_BUDGET)
-            if not solver.solve():
-                return None
             
-            assignment = set(solver.get_model())
-        
         cone_inputs = miter.get_cone_inputs(complete_cone)
         if not cone_inputs:
             return None
         
-        critical_inputs = identify_critical_inputs_adaptive(
-            clauses, assignment, cone_inputs, miter.var_map
+        # Pass all inputs to allow blocking clause generation
+        critical_inputs = identify_all_sat_critical_inputs(
+            clauses, cone_inputs, miter.var_map, miter.inputs, max_patterns=3
         )
         
         if len(critical_inputs) < 1:
@@ -1482,14 +1511,6 @@ def dict_to_data(result_dict):
 def sample_faults(all_gates, sample_size, seed=42):
     """
     Randomly sample faults from a circuit.
-    
-    Args:
-        all_gates: List of gate names
-        sample_size: Number of faults to sample (not gates!)
-        seed: Random seed for reproducibility
-    
-    Returns:
-        List of (gate_name, fault_type) tuples
     """
     random.seed(seed)
     
@@ -1501,7 +1522,6 @@ def sample_faults(all_gates, sample_size, seed=42):
     
     # Sample randomly
     if len(all_faults) <= sample_size:
-        # If requested more than available, return all
         return all_faults
     
     return random.sample(all_faults, sample_size)
@@ -1511,14 +1531,6 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                               max_faults=None, seed=42):
     """
     Generate dataset with optional random fault sampling.
-    
-    Args:
-        bench_file: Path to circuit file
-        output_dir: Output directory
-        num_workers: Number of parallel workers
-        save_interval: Save checkpoint every N samples
-        max_faults: If specified, randomly sample this many faults. If None, process all.
-        seed: Random seed for fault sampling
     """
     
     # Parse circuit
@@ -1541,7 +1553,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
             fault_list.append((bench_file, gate, 0))
             fault_list.append((bench_file, gate, 1))
     
-    print(f"Processing {len(fault_list)} faults using {num_workers} workers (ROBUST ADAPTIVE mode)...")
+    print(f"Processing {len(fault_list)} faults using {num_workers} workers (ALL-SAT mode)...")
     
     # Setup save paths
     os.makedirs(output_dir, exist_ok=True)
@@ -1584,7 +1596,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
                             pickle.dump(dataset, f)
                         os.replace(temp_save_path, save_path)
                         last_save_count = len(dataset)
-                        print(f"  → Saved checkpoint: {len(dataset)} samples")
+                        print(f"  -> Saved checkpoint: {len(dataset)} samples")
                     except Exception as e:
                         print(f"  Warning: Could not save checkpoint: {e}")
                 
@@ -2581,12 +2593,12 @@ class VectorizedGraphExtractor:
         x = self.x_base.clone()
         tid = self.name_to_idx.get(fault_name)
         
-        # 17th Feature: Target Value
-        target_feat = torch.full((self.num_nodes, 1), 0.5, device=self.device)
+        # FIX 1: Broadcast the target fault value GLOBALLY
+        fault_val = 0.0 if fault_type == 1 else 1.0
+        target_feat = torch.full((self.num_nodes, 1), fault_val, device=self.device)
         
         if tid is not None:
             x[tid, 10] = 1.0  # Fault location marker
-            target_feat[tid] = 0.0 if fault_type == 1 else 1.0
             
             # BFS Distance
             dist = torch.full((self.num_nodes,), -1.0, device=self.device)
@@ -2617,7 +2629,11 @@ class VectorizedGraphExtractor:
                 x[mask_visited, 11] = 1.0 - (dist[mask_visited] / max_d)
         
         x = torch.cat([x, target_feat], dim=1)
-        return Data(x=x, edge_index=self.edge_index, node_names=self.ordered_names)
+        
+        # FIX 2: Create undirected edges ONLY for the GNN inference data
+        undirected_edge_index = torch.cat([self.edge_index, self.edge_index.flip(0)], dim=1)
+        
+        return Data(x=x, edge_index=undirected_edge_index, node_names=self.ordered_names)
 ===== train_model_2.py =====
 """
 Complete Model Training Script with Critical Input Support
@@ -2636,24 +2652,43 @@ import os
 import pickle
 from pathlib import Path
 import argparse
-from datetime import datetime
 
 
 # ============================================================================
 # MODEL ARCHITECTURE
 # ============================================================================
 
+class BiGNNLayer(nn.Module):
+    """Bidirectional message passing layer to separate input/output logic."""
+    def __init__(self, in_dim, out_dim, dropout):
+        super().__init__()
+        # Ensure out_dim is divisible by 2 for concatenation
+        half_dim = out_dim // 2
+        
+        # Forward edges: what outputs hear from inputs
+        self.conv_fwd = GATv2Conv(in_dim, half_dim, heads=2, concat=False, dropout=dropout)
+        
+        # Backward edges: what inputs hear from outputs
+        self.conv_bwd = GATv2Conv(in_dim, half_dim, heads=2, concat=False, dropout=dropout)
+        
+    def forward(self, x, edge_index_fwd, edge_index_bwd):
+        out_fwd = self.conv_fwd(x, edge_index_fwd)
+        out_bwd = self.conv_bwd(x, edge_index_bwd)
+        # Combine forward and backward message passing
+        return torch.cat([out_fwd, out_bwd], dim=-1)
+
+
 class CircuitGNN_Polarity(torch.nn.Module):
     """
     GNN for predicting input polarities in circuit ATPG.
     
-    Optimized for critical input learning with:
-    - Deeper architecture (12 layers)
-    - Residual connections
-    - Better normalization
+    Optimized with:
+    - Bi-directional message passing (distinguishes upstream vs downstream)
+    - Shallower architecture (5 layers) to prevent oversmoothing
+    - Jumping Knowledge (concatenating all layers)
     """
     
-    def __init__(self, num_node_features=17, num_layers=12, hidden_dim=64, dropout=0.1):
+    def __init__(self, num_node_features=17, num_layers=5, hidden_dim=64, dropout=0.1):
         super().__init__()
         
         self.num_layers = num_layers
@@ -2666,42 +2701,56 @@ class CircuitGNN_Polarity(torch.nn.Module):
             nn.ELU()
         )
         
-        # GNN layers with residual connections
+        # Bi-directional GNN layers
         self.convs = torch.nn.ModuleList()
         self.bns = torch.nn.ModuleList()
         
         for i in range(num_layers):
-            self.convs.append(
-                GATv2Conv(hidden_dim, hidden_dim, heads=2, concat=False, dropout=dropout)
-            )
-            self.bns.append(torch.nn.BatchNorm1d(hidden_dim))
+            self.convs.append(BiGNNLayer(hidden_dim, hidden_dim, dropout))
+            self.bns.append(nn.BatchNorm1d(hidden_dim))
         
-        # Output head
+        # Output head with Jumping Knowledge 
+        # (hidden_dim for original proj + hidden_dim for each layer)
+        jk_dim = hidden_dim * (num_layers + 1)
         self.output_head = nn.Sequential(
-            nn.Linear(hidden_dim, 32),
+            nn.Linear(jk_dim, 64),
             nn.ELU(),
             nn.Dropout(dropout),
-            nn.Linear(32, 1)
+            nn.Linear(64, 1)
         )
     
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         
+        # Dynamically separate forward and backward edges
+        # Feature index 8 is topological forward depth. Forward edges always flow to a higher depth.
+        src, dst = edge_index
+        fwd_mask = x[src, 8] < x[dst, 8]
+        edge_index_fwd = edge_index[:, fwd_mask]
+        edge_index_bwd = edge_index_fwd[[1, 0]]  # The exact reverse of forward edges
+        
         # Input projection
         x = self.input_proj(x)
+        
+        # Store layer outputs for Jumping Knowledge
+        xs = [x]
         
         # GNN layers with residual connections
         for i in range(self.num_layers):
             identity = x
-            x = self.convs[i](x, edge_index)
+            x = self.convs[i](x, edge_index_fwd, edge_index_bwd)
             x = self.bns[i](x)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
             x = x + identity  # Residual connection
+            xs.append(x)
+        
+        # Concatenate original projection + all GAT layers
+        x_jk = torch.cat(xs, dim=1) 
         
         # Output
-        x = self.output_head(x)
-        return torch.sigmoid(x)
+        x_out = self.output_head(x_jk)
+        return torch.sigmoid(x_out)
 
 
 # ============================================================================
@@ -2709,50 +2758,21 @@ class CircuitGNN_Polarity(torch.nn.Module):
 # ============================================================================
 
 def weighted_bce_loss(pred, target, mask, importance_weights=None):
-    """
-    Binary cross-entropy loss with optional importance weighting.
-    
-    Args:
-        pred: Predicted polarities [N, 1]
-        target: Ground truth polarities [N, 1]
-        mask: Training mask [N, 1] (1.0 for labeled nodes, 0.0 otherwise)
-        importance_weights: Optional [N, 1] weights for each node
-    
-    Returns:
-        Weighted loss scalar
-    """
-    # Compute BCE for all nodes
+    """Binary cross-entropy loss with optional importance weighting."""
     bce = F.binary_cross_entropy(pred, target, reduction='none')
-    
-    # Apply importance weights if provided
     if importance_weights is not None:
         bce = bce * importance_weights
-    
-    # Apply mask and average over labeled nodes
     masked_loss = (bce * mask).sum() / mask.sum().clamp(min=1)
-    
     return masked_loss
 
 
 def focal_loss(pred, target, mask, alpha=0.25, gamma=2.0):
-    """
-    Focal loss to handle class imbalance in critical inputs.
-    
-    Focuses training on hard examples (inputs with uncertain predictions).
-    """
-    # Compute BCE
+    """Focal loss to handle class imbalance in critical inputs."""
     bce = F.binary_cross_entropy(pred, target, reduction='none')
-    
-    # Compute focal weight
     p_t = pred * target + (1 - pred) * (1 - target)
     focal_weight = (1 - p_t) ** gamma
-    
-    # Combine
     focal = alpha * focal_weight * bce
-    
-    # Apply mask
     masked_loss = (focal * mask).sum() / mask.sum().clamp(min=1)
-    
     return masked_loss
 
 
@@ -2761,7 +2781,6 @@ def focal_loss(pred, target, mask, alpha=0.25, gamma=2.0):
 # ============================================================================
 
 def train_epoch(model, loader, optimizer, device, use_focal=False, focal_alpha=0.25, focal_gamma=2.0):
-    """Train for one epoch."""
     model.train()
     total_loss = 0
     num_batches = 0
@@ -2770,22 +2789,16 @@ def train_epoch(model, loader, optimizer, device, use_focal=False, focal_alpha=0
         batch = batch.to(device)
         optimizer.zero_grad()
         
-        # Forward pass
         pred = model(batch)
-        
-        # Get mask and targets
         mask = batch.train_mask
         target = batch.y_polarity
         
-        # Compute loss
         if use_focal:
             loss = focal_loss(pred, target, mask, focal_alpha, focal_gamma)
         else:
-            # Use importance weights if available
             importance = batch.y_importance if hasattr(batch, 'y_importance') else None
             loss = weighted_bce_loss(pred, target, mask, importance)
         
-        # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -2797,7 +2810,6 @@ def train_epoch(model, loader, optimizer, device, use_focal=False, focal_alpha=0
 
 
 def evaluate(model, loader, device):
-    """Evaluate on validation/test set."""
     model.eval()
     total_loss = 0
     total_correct = 0
@@ -2807,19 +2819,13 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for batch in loader:
             batch = batch.to(device)
-            
-            # Forward pass
             pred = model(batch)
-            
-            # Get mask and targets
             mask = batch.train_mask
             target = batch.y_polarity
             
-            # Compute loss
             loss = weighted_bce_loss(pred, target, mask)
             total_loss += loss.item()
             
-            # Compute accuracy on labeled nodes
             pred_binary = (pred > 0.5).float()
             correct = ((pred_binary == target) * mask).sum().item()
             labeled = mask.sum().item()
@@ -2839,20 +2845,7 @@ def evaluate(model, loader, device):
 # ============================================================================
 
 def load_dataset(data_dir, train_ratio=0.8, val_ratio=0.1):
-    """
-    Load and split dataset.
-    
-    Args:
-        data_dir: Directory containing .pkl files
-        train_ratio: Fraction for training
-        val_ratio: Fraction for validation (rest is test)
-    
-    Returns:
-        train_dataset, val_dataset, test_dataset
-    """
     all_data = []
-    
-    # Load all pickle files
     data_dir = Path(data_dir)
     for pkl_file in data_dir.glob('*.pkl'):
         print(f"Loading {pkl_file.name}...")
@@ -2861,11 +2854,8 @@ def load_dataset(data_dir, train_ratio=0.8, val_ratio=0.1):
             all_data.extend(data)
     
     print(f"Loaded {len(all_data)} samples total")
-    
-    # Shuffle
     np.random.shuffle(all_data)
     
-    # Split
     n = len(all_data)
     n_train = int(n * train_ratio)
     n_val = int(n * val_ratio)
@@ -2875,7 +2865,6 @@ def load_dataset(data_dir, train_ratio=0.8, val_ratio=0.1):
     test_dataset = all_data[n_train + n_val:]
     
     print(f"Split: {len(train_dataset)} train, {len(val_dataset)} val, {len(test_dataset)} test")
-    
     return train_dataset, val_dataset, test_dataset
 
 
@@ -2884,32 +2873,21 @@ def load_dataset(data_dir, train_ratio=0.8, val_ratio=0.1):
 # ============================================================================
 
 def train_model(args):
-    """Main training function."""
-    
-    # Set random seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    
-    # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load dataset
     print("Loading dataset...")
-    train_dataset, val_dataset, test_dataset = load_dataset(
-        args.data_dir, args.train_ratio, args.val_ratio
-    )
+    train_dataset, val_dataset, test_dataset = load_dataset(args.data_dir, args.train_ratio, args.val_ratio)
     
-    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # Get number of node features from first sample
     num_features = train_dataset[0].x.shape[1]
     print(f"Number of node features: {num_features}")
     
-    # Create model
     print("Creating model...")
     model = CircuitGNN_Polarity(
         num_node_features=num_features,
@@ -2918,56 +2896,29 @@ def train_model(args):
         dropout=args.dropout
     ).to(device)
     
-    # Count parameters
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model has {num_params:,} trainable parameters")
     
-    # Optimizer
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10
-    )
-    
-    # Training loop
     print("\nStarting training...")
     best_val_loss = float('inf')
     best_val_acc = 0.0
     patience_counter = 0
     
     for epoch in range(args.epochs):
-        # Train
-        train_loss = train_epoch(
-            model, train_loader, optimizer, device,
-            use_focal=args.use_focal,
-            focal_alpha=args.focal_alpha,
-            focal_gamma=args.focal_gamma
-        )
-        
-        # Validate
+        train_loss = train_epoch(model, train_loader, optimizer, device, args.use_focal, args.focal_alpha, args.focal_gamma)
         val_loss, val_acc = evaluate(model, val_loader, device)
-        
-        # Update scheduler
         scheduler.step(val_loss)
         
-        # Print progress
-        print(f"Epoch {epoch+1}/{args.epochs}: "
-              f"train_loss={train_loss:.4f}, "
-              f"val_loss={val_loss:.4f}, "
-              f"val_acc={val_acc:.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
         
-        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_val_acc = val_acc
             patience_counter = 0
             
-            # Save checkpoint
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -2980,87 +2931,52 @@ def train_model(args):
             print(f"  -> Saved best model (val_loss={val_loss:.4f})")
         else:
             patience_counter += 1
-            
-            # Early stopping
             if patience_counter >= args.patience:
                 print(f"\nEarly stopping at epoch {epoch+1}")
                 break
     
-    # Load best model and evaluate on test set
     print("\nLoading best model for final evaluation...")
     checkpoint = torch.load(args.save_path, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     test_loss, test_acc = evaluate(model, test_loader, device)
-    print(f"\nFinal Test Results:")
-    print(f"  Loss: {test_loss:.4f}")
-    print(f"  Accuracy: {test_acc:.4f}")
-    print(f"\nBest Validation Results (epoch {checkpoint['epoch']+1}):")
-    print(f"  Loss: {best_val_loss:.4f}")
-    print(f"  Accuracy: {best_val_acc:.4f}")
+    print(f"\nFinal Test Results: Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}")
+    print(f"Best Validation Results (epoch {checkpoint['epoch']+1}): Loss: {best_val_loss:.4f}, Accuracy: {best_val_acc:.4f}")
     
     return model
 
 
-# ============================================================================
-# COMMAND LINE INTERFACE
-# ============================================================================
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train GNN for circuit polarity prediction')
     
-    # Data
-    parser.add_argument('--data_dir', type=str, required=True,
-                       help='Directory containing training data (.pkl files)')
-    parser.add_argument('--train_ratio', type=float, default=0.8,
-                       help='Fraction of data for training')
-    parser.add_argument('--val_ratio', type=float, default=0.1,
-                       help='Fraction of data for validation')
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing training data (.pkl files)')
+    parser.add_argument('--train_ratio', type=float, default=0.8, help='Fraction of data for training')
+    parser.add_argument('--val_ratio', type=float, default=0.1, help='Fraction of data for validation')
     
-    # Model
-    parser.add_argument('--num_layers', type=int, default=12,
-                       help='Number of GNN layers')
-    parser.add_argument('--hidden_dim', type=int, default=64,
-                       help='Hidden dimension size')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                       help='Dropout rate')
+    parser.add_argument('--num_layers', type=int, default=5, help='Number of GNN layers')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension size')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     
-    # Training
-    parser.add_argument('--epochs', type=int, default=3,
-                       help='Maximum number of epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
-                       help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay')
-    parser.add_argument('--patience', type=int, default=30,
-                       help='Early stopping patience')
+    parser.add_argument('--epochs', type=int, default=8, help='Maximum number of epochs')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
+    parser.add_argument('--patience', type=int, default=30, help='Early stopping patience')
     
-    # Loss function
-    parser.add_argument('--use_focal', action='store_true',
-                       help='Use focal loss instead of BCE')
-    parser.add_argument('--focal_alpha', type=float, default=0.25,
-                       help='Focal loss alpha parameter')
-    parser.add_argument('--focal_gamma', type=float, default=2.0,
-                       help='Focal loss gamma parameter')
+    parser.add_argument('--use_focal', action='store_true', help='Use focal loss instead of BCE')
+    parser.add_argument('--focal_alpha', type=float, default=0.25, help='Focal loss alpha parameter')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal loss gamma parameter')
     
-    # Misc
-    parser.add_argument('--save_path', type=str, default='best_model.pt',
-                       help='Path to save best model')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
+    parser.add_argument('--save_path', type=str, default='best_model.pt', help='Path to save best model')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
     args = parser.parse_args()
     
-    # Create save directory if needed
     save_dir = os.path.dirname(args.save_path)
     if save_dir and not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
-    # Train
     model = train_model(args)
-    
     print(f"\nTraining complete! Model saved to {args.save_path}")
 ===== validate_parser.py =====
 """

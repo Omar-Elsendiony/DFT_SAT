@@ -62,68 +62,50 @@ class WireFaultMiter:
 
     def get_complete_atpg_cone(self, gate_name, target_output):
         """
-        Extract the COMPLETE ATPG cone including side inputs.
-        
-        This includes:
-        1. Activation cone: inputs → fault (fan-in)
-        2. Propagation cone: fault → output (fan-out path)
-        3. Side input cones: other logic affecting propagation gates ⭐
-        
-        Args:
-            gate_name: Fault site
-            target_output: Target primary output (used to limit scope)
-            
-        Returns:
-            Complete ATPG cone as list of (output, gate_type, inputs) tuples
+        Extract the PERFECT ATPG cone using Forward/Backward intersection.
         """
-        # Step 1: Trace the propagation path (fault → target output)
-        propagation_path = set()
-        visited_prop = set()
+        # Step 1: Backward reachability from target_output
+        backward_visited = set()
+        def dfs_back(node):
+            if node in backward_visited: return
+            backward_visited.add(node)
+            if node in self.parser.gate_dict:
+                _, inputs = self.parser.gate_dict[node]
+                for inp in inputs:
+                    dfs_back(inp)
+        dfs_back(target_output)
+
+        # Step 2: Forward reachability from fault site
+        forward_visited = set()
+        def dfs_forward(node):
+            if node in forward_visited: return
+            forward_visited.add(node)
+            for next_gate in self.parser.get_fanout(node):
+                dfs_forward(next_gate)
+        dfs_forward(gate_name)
+
+        # Step 3: The strict propagation path is the intersection!
+        # This completely eliminates dead-end branches.
+        propagation_path = forward_visited.intersection(backward_visited)
         
-        def trace_propagation(node, target):
-            """Find all gates on path from fault to specific output"""
-            if node in visited_prop:
-                return
-            visited_prop.add(node)
-            
-            # Stop if we reached the target
-            if node == target:
-                return
-            
-            # Add to path if it's a gate (not the fault itself yet)
-            if node != gate_name and node in self.parser.gate_dict:
-                propagation_path.add(node)
-            
-            # Continue tracing only if we haven't reached target
-            if node != target:
-                fanout = self.parser.get_fanout(node)
-                for next_gate in fanout:
-                    if next_gate not in visited_prop:
-                        trace_propagation(next_gate, target)
-        
-        trace_propagation(gate_name, target_output)
-        
-        # Step 2: For EACH propagation gate, get its COMPLETE fan-in
-        # This captures side inputs! ⭐
+        # Step 4: Get side-inputs for the STRICT propagation path
         side_logic = set()
         propagation_cone = []
         
         for prop_gate in propagation_path:
-            # Add the propagation gate itself
             if prop_gate in self.parser.gate_dict:
                 g_type, inputs = self.parser.gate_dict[prop_gate]
                 propagation_cone.append((prop_gate, g_type, inputs))
                 
                 # Get ALL logic feeding this propagation gate
-                # (excluding the fault gate to avoid double-counting)
                 gate_fanin = self._get_fanin_recursive(prop_gate, stop_at=gate_name)
                 for fanin_gate, _, _ in gate_fanin:
                     side_logic.add(fanin_gate)
         
-        # Step 3: Get fault activation cone (fan-in to fault)
+        # Step 5: Get fault activation cone
         activation_cone = self._get_fanin_recursive(gate_name, stop_at=None)
         
-        # Step 4: Build side input cone (gates in side_logic but not activation)
+        # Step 6: Build side input cone (excluding activation gates)
         side_cone = []
         activation_gates = set([g[0] for g in activation_cone])
         
@@ -132,13 +114,13 @@ class WireFaultMiter:
                 g_type, inputs = self.parser.gate_dict[gate]
                 side_cone.append((gate, g_type, inputs))
         
-        # Step 5: Add the fault gate itself
+        # Step 7: Add fault gate itself
         fault_gate = []
         if gate_name in self.parser.gate_dict:
             g_type, inputs = self.parser.gate_dict[gate_name]
             fault_gate = [(gate_name, g_type, inputs)]
-        
-        # Step 6: Combine all components and deduplicate
+            
+        # Combine and deduplicate
         all_gates = activation_cone + fault_gate + side_cone + propagation_cone
         seen = set()
         complete_cone = []
@@ -147,8 +129,81 @@ class WireFaultMiter:
             if gate[0] not in seen:
                 seen.add(gate[0])
                 complete_cone.append(gate)
-        
+                
         return complete_cone
+
+
+    def build_miter(self, fault_wire, fault_type=None, force_diff=1, target_output=None):
+        """Build miter circuit targeting a SPECIFIC output if provided."""
+        clauses = []
+        
+        # 1. Good Circuit
+        for out, g_type, inputs in self.gates:
+            self._add_gate_clauses(clauses, self.var_map[out], g_type, 
+                                  [self.var_map[i] for i in inputs])
+            
+        # 2. Faulty Circuit
+        self.faulty_map = {name: self.var_map[name] for name in self.inputs}
+        for out, _, _ in self.gates:
+            if out not in self.faulty_map:
+                self.faulty_map[out] = self.next_var
+                self.next_var += 1
+                
+        # Inject Fault
+        if fault_wire in self.faulty_map and fault_type is not None:
+            f_var = self.faulty_map[fault_wire]
+            if fault_type == 1: 
+                clauses.append([f_var])
+            elif fault_type == 0: 
+                clauses.append([-f_var])
+
+        for out, g_type, inputs in self.gates:
+            if out == fault_wire: 
+                continue
+            out_var = self.faulty_map[out]
+            in_vars = [self.faulty_map.get(i) for i in inputs]
+            if None in in_vars: 
+                continue 
+            self._add_gate_clauses(clauses, out_var, g_type, in_vars)
+
+        # 3. Miter Comparator
+        miter_out = self.next_var
+        self.next_var += 1
+        diff_vars = []
+        
+        for out in sorted(list(set(self.outputs))):
+            if out not in self.var_map or out not in self.faulty_map: 
+                continue
+                
+            # NEW: If a specific target_output is requested, ignore the rest!
+            if target_output is not None and out != target_output:
+                continue
+                
+            good = self.var_map[out]
+            bad = self.faulty_map[out]
+            diff = self.next_var
+            self.next_var += 1
+            
+            clauses.extend([
+                [-good, -bad, -diff], 
+                [good, bad, -diff], 
+                [-good, bad, diff], 
+                [good, -bad, diff]
+            ])
+            diff_vars.append(diff)
+            
+        # If the fault can't reach the target output, miter is invalid
+        if not diff_vars:
+            return []
+            
+        big_or = [-miter_out]
+        for d in diff_vars:
+            clauses.append([-d, miter_out])
+            big_or.append(d)
+        clauses.append(big_or)
+        clauses.append([miter_out])
+        
+        return clauses
 
     def _get_fanin_recursive(self, gate_name, stop_at=None):
         """
@@ -189,68 +244,68 @@ class WireFaultMiter:
                     cone_inputs.add(inp)
         return cone_inputs
 
-    def build_miter(self, fault_wire, fault_type=None, force_diff=1):
-        """Build miter circuit for fault detection."""
-        clauses = []
+    # def build_miter(self, fault_wire, fault_type=None, force_diff=1):
+    #     """Build miter circuit for fault detection."""
+    #     clauses = []
         
-        # 1. Good Circuit
-        for out, g_type, inputs in self.gates:
-            self._add_gate_clauses(clauses, self.var_map[out], g_type, 
-                                  [self.var_map[i] for i in inputs])
+    #     # 1. Good Circuit
+    #     for out, g_type, inputs in self.gates:
+    #         self._add_gate_clauses(clauses, self.var_map[out], g_type, 
+    #                               [self.var_map[i] for i in inputs])
             
-        # 2. Faulty Circuit
-        self.faulty_map = {name: self.var_map[name] for name in self.inputs}
-        for out, _, _ in self.gates:
-            if out not in self.faulty_map:
-                self.faulty_map[out] = self.next_var
-                self.next_var += 1
+    #     # 2. Faulty Circuit
+    #     self.faulty_map = {name: self.var_map[name] for name in self.inputs}
+    #     for out, _, _ in self.gates:
+    #         if out not in self.faulty_map:
+    #             self.faulty_map[out] = self.next_var
+    #             self.next_var += 1
                 
-        # Inject Fault
-        if fault_wire in self.faulty_map and fault_type is not None:
-            f_var = self.faulty_map[fault_wire]
-            if fault_type == 1: 
-                clauses.append([f_var])
-            elif fault_type == 0: 
-                clauses.append([-f_var])
+    #     # Inject Fault
+    #     if fault_wire in self.faulty_map and fault_type is not None:
+    #         f_var = self.faulty_map[fault_wire]
+    #         if fault_type == 1: 
+    #             clauses.append([f_var])
+    #         elif fault_type == 0: 
+    #             clauses.append([-f_var])
 
-        for out, g_type, inputs in self.gates:
-            if out == fault_wire: 
-                continue
-            out_var = self.faulty_map[out]
-            in_vars = [self.faulty_map.get(i) for i in inputs]
-            if None in in_vars: 
-                continue 
-            self._add_gate_clauses(clauses, out_var, g_type, in_vars)
+    #     for out, g_type, inputs in self.gates:
+    #         if out == fault_wire: 
+    #             continue
+    #         out_var = self.faulty_map[out]
+    #         in_vars = [self.faulty_map.get(i) for i in inputs]
+    #         if None in in_vars: 
+    #             continue 
+    #         self._add_gate_clauses(clauses, out_var, g_type, in_vars)
 
-        # 3. Miter Comparator
-        miter_out = self.next_var
-        self.next_var += 1
-        diff_vars = []
+    #     # 3. Miter Comparator
+    #     miter_out = self.next_var
+    #     self.next_var += 1
+    #     diff_vars = []
         
-        for out in sorted(list(set(self.outputs))):
-            if out not in self.var_map or out not in self.faulty_map: 
-                continue
-            good = self.var_map[out]
-            bad = self.faulty_map[out]
-            diff = self.next_var
-            self.next_var += 1
+    #     for out in sorted(list(set(self.outputs))):
+    #         if out not in self.var_map or out not in self.faulty_map: 
+    #             continue
+    #         good = self.var_map[out]
+    #         bad = self.faulty_map[out]
+    #         diff = self.next_var
+    #         self.next_var += 1
             
-            clauses.extend([
-                [-good, -bad, -diff], 
-                [good, bad, -diff], 
-                [-good, bad, diff], 
-                [good, -bad, diff]
-            ])
-            diff_vars.append(diff)
+    #         clauses.extend([
+    #             [-good, -bad, -diff], 
+    #             [good, bad, -diff], 
+    #             [-good, bad, diff], 
+    #             [good, -bad, diff]
+    #         ])
+    #         diff_vars.append(diff)
             
-        big_or = [-miter_out]
-        for d in diff_vars:
-            clauses.append([-d, miter_out])
-            big_or.append(d)
-        clauses.append(big_or)
-        clauses.append([miter_out])
+    #     big_or = [-miter_out]
+    #     for d in diff_vars:
+    #         clauses.append([-d, miter_out])
+    #         big_or.append(d)
+    #     clauses.append(big_or)
+    #     clauses.append([miter_out])
         
-        return clauses
+    #     return clauses
 
     def _add_gate_clauses(self, clauses, out, g_type, inputs):
         """Add CNF clauses for a gate."""
