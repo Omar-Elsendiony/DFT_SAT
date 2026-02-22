@@ -6,6 +6,7 @@ Features:
 - Incremental saving every 100 samples
 - Resume from checkpoint
 - No PyTorch pickling issues
+- Encodes relative folder paths into output file names (folder__subfolder__file.pkl)
 """
 
 from pysat.solvers import Glucose3, Minisat22
@@ -196,14 +197,13 @@ def sample_faults(all_gates, sample_size, seed=42):
     
     # Sample randomly
     if len(all_faults) <= sample_size:
-        # If requested more than available, return all
         return all_faults
     
     return random.sample(all_faults, sample_size)
 
 
 def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interval=100, 
-                              max_faults=None, seed=42):
+                              max_faults=None, seed=42, root_dir=None):
     """
     Generate dataset with optional random fault sampling.
     
@@ -214,6 +214,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
         save_interval: Save checkpoint every N samples
         max_faults: If specified, randomly sample this many faults. If None, process all.
         seed: Random seed for fault sampling
+        root_dir: Root directory for computing relative paths in output filenames
     """
     
     # Parse circuit
@@ -240,7 +241,17 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4, save_interv
     
     # Setup save paths
     os.makedirs(output_dir, exist_ok=True)
-    circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+
+    # Compute safe filename based on relative path
+    if root_dir:
+        try:
+            rel_path = os.path.relpath(bench_file, root_dir)
+            circuit_name = os.path.splitext(rel_path)[0].replace(os.sep, '__').replace('/', '__')
+        except ValueError:
+            circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+    else:
+        circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+
     save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs.pkl')
     temp_save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs_temp.pkl')
     
@@ -337,8 +348,8 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, max_fau
     """Generate dataset for all circuits in folder with optional sampling"""
     from pathlib import Path
     
-    bench_folder = Path(bench_folder)
-    bench_files = list(bench_folder.rglob('*.bench')) + list(bench_folder.rglob('*.v'))
+    bench_folder_path = Path(bench_folder).resolve()
+    bench_files = list(bench_folder_path.rglob('*.bench')) + list(bench_folder_path.rglob('*.v'))
     
     if not bench_files:
         print(f"No .bench or .v files found in {bench_folder}")
@@ -354,7 +365,8 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, max_fau
     
     for i, bench_file in enumerate(bench_files):
         print(f"\n{'='*70}")
-        print(f"[{i+1}/{len(bench_files)}] Processing {bench_file.name}...")
+        rel_display_path = os.path.relpath(str(bench_file), str(bench_folder_path))
+        print(f"[{i+1}/{len(bench_files)}] Processing {rel_display_path}...")
         print(f"{'='*70}")
         
         circuit_start = time.time()
@@ -362,7 +374,8 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, max_fau
         try:
             dataset = generate_dataset_parallel(
                 str(bench_file), output_dir, num_workers, 
-                save_interval=100, max_faults=max_faults_per_circuit, seed=seed
+                save_interval=100, max_faults=max_faults_per_circuit, seed=seed,
+                root_dir=str(bench_folder_path)
             )
             circuit_time = time.time() - circuit_start
             
@@ -420,7 +433,8 @@ if __name__ == "__main__":
     elif bench_path.is_file():
         generate_dataset_parallel(
             args.bench, args.output, args.workers, args.save_interval,
-            max_faults=args.max_faults, seed=args.seed
+            max_faults=args.max_faults, seed=args.seed,
+            root_dir=str(bench_path.parent)
         )
     else:
         print(f"Error: {args.bench} is not a valid file or directory")
