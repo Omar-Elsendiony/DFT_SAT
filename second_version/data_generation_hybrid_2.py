@@ -274,11 +274,14 @@ def sample_faults(all_gates, sample_size, seed=42):
 
 
 def generate_dataset_parallel(bench_file, output_dir, num_workers=4, 
-                              save_interval=100, max_faults=None, seed=42):
+                              save_interval=100, max_faults=None, seed=42, root_dir=None):
     """
     Generate dataset processing ALL reachable outputs per fault.
     
     This extracts maximum training data from each fault!
+    
+    Args:
+        root_dir: Root directory for computing relative paths (for nested folders)
     """
     
     # Parse circuit
@@ -304,9 +307,22 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
     print(f"Processing {len(fault_list)} faults using {num_workers} workers")
     print(f"Mode: ALL OUTPUTS (extracts maximum training data)")
     
-    # Setup save paths
+    # Setup save paths with relative path encoding
     os.makedirs(output_dir, exist_ok=True)
-    circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+    
+    # Encode relative path in filename: folder1__folder2__file_name
+    if root_dir:
+        try:
+            from pathlib import Path
+            rel_path = Path(bench_file).relative_to(Path(root_dir))
+            # Replace path separators with double underscores, remove extension
+            circuit_name = str(rel_path.with_suffix('')).replace(os.sep, '__').replace('/', '__')
+        except ValueError:
+            # Fallback if relative path fails
+            circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+    else:
+        circuit_name = os.path.basename(bench_file).replace('.bench', '').replace('.v', '')
+    
     save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs.pkl')
     temp_save_path = os.path.join(output_dir, f'{circuit_name}_critical_inputs_temp.pkl')
     
@@ -426,17 +442,19 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
 
 def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, 
                                 max_faults_per_circuit=None, seed=42):
-    """Generate dataset for all circuits in folder"""
+    """Generate dataset for all circuits in folder (recursive with rglob)"""
     from pathlib import Path
     
-    bench_folder = Path(bench_folder)
-    bench_files = list(bench_folder.glob('*.bench')) + list(bench_folder.glob('*.v'))
+    bench_folder_path = Path(bench_folder).resolve()
+    
+    # Use rglob for recursive search
+    bench_files = list(bench_folder_path.rglob('*.bench')) + list(bench_folder_path.rglob('*.v'))
     
     if not bench_files:
         print(f"No .bench or .v files found in {bench_folder}")
         return 0
     
-    print(f"Found {len(bench_files)} circuits in {bench_folder}")
+    print(f"Found {len(bench_files)} circuits in {bench_folder} (recursive search)")
     if max_faults_per_circuit:
         print(f"Will sample {max_faults_per_circuit} faults per circuit (seed={seed})")
     print(f"Mode: ALL OUTPUTS (maximum data extraction)")
@@ -447,7 +465,14 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4,
     
     for i, bench_file in enumerate(bench_files):
         print(f"\n{'='*70}")
-        print(f"[{i+1}/{len(bench_files)}] Processing {bench_file.name}...")
+        
+        # Display relative path for nested folders
+        try:
+            rel_path = bench_file.relative_to(bench_folder_path)
+            print(f"[{i+1}/{len(bench_files)}] Processing {rel_path}...")
+        except ValueError:
+            print(f"[{i+1}/{len(bench_files)}] Processing {bench_file.name}...")
+        
         print(f"{'='*70}")
         
         circuit_start = time.time()
@@ -455,7 +480,8 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4,
         try:
             dataset = generate_dataset_parallel(
                 str(bench_file), output_dir, num_workers, 
-                save_interval=100, max_faults=max_faults_per_circuit, seed=seed
+                save_interval=100, max_faults=max_faults_per_circuit, seed=seed,
+                root_dir=str(bench_folder_path)  # Pass root directory for relative paths
             )
             circuit_time = time.time() - circuit_start
             
@@ -539,9 +565,11 @@ Expected: 2-3x more training samples compared to single-output mode!
             max_faults_per_circuit=args.max_faults, seed=args.seed
         )
     elif bench_path.is_file():
+        # For single file, use parent directory as root
         generate_dataset_parallel(
             args.bench, args.output, args.workers, args.save_interval,
-            max_faults=args.max_faults, seed=args.seed
+            max_faults=args.max_faults, seed=args.seed,
+            root_dir=str(bench_path.parent)
         )
     else:
         print(f"Error: {args.bench} is not a valid file or directory")
