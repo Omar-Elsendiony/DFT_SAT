@@ -125,7 +125,7 @@ def process_single_fault_all_outputs(args):
         if not reachable:
             return None
         
-        # Create extractor once (reused for all outputs)
+        # Create extractor once (shared across outputs for this fault)
         extractor = VectorizedGraphExtractor(
             bench_file, 
             var_map=miter.var_map, 
@@ -196,23 +196,37 @@ def process_single_fault_all_outputs(args):
                 # =========================================================
                 # CREATE RESULT (Plain Python dict for pickling)
                 # =========================================================
+                # Convert ALL data to plain Python types (no PyTorch references)
+                node_names_list = [str(name) for name in data.node_names]  # Ensure strings
+                x_numpy = data.x.detach().cpu().numpy().copy()  # Detach + copy!
+                edge_index_numpy = data.edge_index.detach().cpu().numpy().copy()  # Detach + copy!
+                
+                # Convert critical_inputs dict to plain types
+                critical_inputs_plain = {str(k): float(v) for k, v in critical_inputs.items()}
+                
                 result = {
-                    'node_names': list(data.node_names),
-                    'x': data.x.cpu().numpy(),
-                    'edge_index': data.edge_index.cpu().numpy(),
-                    'critical_inputs': critical_inputs,
-                    'fault_name': fault_name,
-                    'fault_type': fault_type,
-                    'target_output': target_output,  # Track which output
-                    'num_critical_inputs': len(critical_inputs),
-                    'num_cone_inputs': len(cone_inputs)
+                    'node_names': node_names_list,
+                    'x': x_numpy,
+                    'edge_index': edge_index_numpy,
+                    'critical_inputs': critical_inputs_plain,
+                    'fault_name': str(fault_name),
+                    'fault_type': int(fault_type),
+                    'target_output': str(target_output),
+                    'num_critical_inputs': int(len(critical_inputs)),
+                    'num_cone_inputs': int(len(cone_inputs))
                 }
                 
                 results.append(result)
                 
+                # Clean up data object
+                del data
+                
             except Exception as e:
                 # Skip this output, continue with next
                 continue
+        
+        # Clean up extractor after all outputs processed
+        del extractor
         
         # Return list of results (one per successful output)
         # If no outputs succeeded, return None
@@ -487,10 +501,19 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4,
             
             total_samples += len(dataset)
             print(f"Circuit completed in {circuit_time:.1f}s ({len(dataset)} samples)")
+            
+            # Force garbage collection between circuits
+            import gc
+            gc.collect()
+            
         except Exception as e:
             print(f"Error processing {bench_file.name}: {e}")
             import traceback
             traceback.print_exc()
+            
+            # Force cleanup on error
+            import gc
+            gc.collect()
             continue
     
     total_time = time.time() - start_time
