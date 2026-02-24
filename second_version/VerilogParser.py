@@ -247,7 +247,7 @@ class VerilogParser:
                     # (This is OK for ATPG - we can set Q to any value)
                     pass
                 
-                print(f"  [INFO] Detected DFF output by pattern: {wire_name}")
+                # Removed print to avoid flooding output in multiprocessing
     
     def _parse_port_connections(self, port_list):
         """Parse port connections (positional or named)."""

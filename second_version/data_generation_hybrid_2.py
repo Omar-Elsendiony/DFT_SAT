@@ -40,12 +40,44 @@ CONFLICT_BUDGET = 10000
 CRITICAL_INPUT_TEST_BUDGET = 20
 PER_FAULT_TIMEOUT = 300
 
+# ============================================================================
+# Per-Process Parser Cache (avoids re-parsing same circuit 1000x)
+# ============================================================================
+_parser_cache = {}
+_miter_cache = {}
+_extractor_cache = {}
 
-def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map):
+def get_cached_parser(bench_file):
+    """Get cached parser for this process."""
+    if bench_file not in _parser_cache:
+        if bench_file.endswith('.bench'):
+            _parser_cache[bench_file] = BenchParser(bench_file)
+        else:
+            _parser_cache[bench_file] = VerilogParser(bench_file)
+    return _parser_cache[bench_file]
+
+def get_cached_miter(bench_file):
+    """Get cached miter for this process."""
+    if bench_file not in _miter_cache:
+        _miter_cache[bench_file] = WireFaultMiter(bench_file)
+    return _miter_cache[bench_file]
+
+def get_cached_extractor(bench_file, var_map):
+    """Get cached extractor for this process."""
+    if bench_file not in _extractor_cache:
+        _extractor_cache[bench_file] = VectorizedGraphExtractor(
+            bench_file, var_map=var_map, device='cpu'
+        )
+    return _extractor_cache[bench_file]
+
+
+def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map, debug=False):
     """ADAPTIVE critical input identification with early termination"""
     critical_inputs = {}
     
     if not cone_inputs:
+        if debug:
+            print("  [DEBUG] No cone inputs")
         return critical_inputs
     
     # Prepare test inputs
@@ -59,10 +91,15 @@ def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map)
         test_inputs.append((inp, var_id, correct_polarity, test_literal))
     
     if not test_inputs:
+        if debug:
+            print("  [DEBUG] No test inputs (all filtered)")
         return critical_inputs
     
     # Shuffle for better sampling
     random.shuffle(test_inputs)
+    
+    if debug:
+        print(f"  [DEBUG] Testing {len(test_inputs)} inputs")
     
     try:
         with Glucose3(bootstrap_with=clauses) as probe:
@@ -80,16 +117,24 @@ def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map)
                     critical_inputs[inp] = 1.0 if correct_polarity else 0.0
                     tests_since_last_critical = 0
                 
-                # Early termination conditions
-                if len(critical_inputs) >= 3 and tests_since_last_critical >= 3:
+                # IMPROVED early termination conditions
+                # Only terminate early if we have SOME critical inputs
+                if len(critical_inputs) >= 3 and tests_since_last_critical >= 5:
                     break
                 
-                if tested_count >= 8 and len(critical_inputs) <= 2:
-                    break
+                # Less aggressive: allow more testing if we have few criticals
+                if tested_count >= 15 and len(critical_inputs) <= 1:
+                    break  # Tested 15 inputs, found 0 or 1 → probably not many criticals
                 
                 if len(critical_inputs) >= 5:
-                    break
-    except:
+                    break  # Found enough
+                    
+        if debug:
+            print(f"  [DEBUG] Found {len(critical_inputs)} critical inputs after testing {tested_count}")
+            
+    except Exception as e:
+        if debug:
+            print(f"  [DEBUG] Exception in critical input ID: {e}")
         pass
     
     return critical_inputs
@@ -99,8 +144,7 @@ def process_single_fault_all_outputs(args):
     """
     Process single fault for ALL reachable outputs.
     
-    Returns LIST of results (one per reachable output).
-    This maximizes training data extraction from each fault!
+    Uses per-process caching to avoid re-parsing the circuit for every fault!
     
     Args:
         args: (bench_file, fault_name, fault_type)
@@ -111,26 +155,16 @@ def process_single_fault_all_outputs(args):
     bench_file, fault_name, fault_type = args
     
     try:
-        # Parse circuit
-        if bench_file.endswith('.bench'):
-            parser = BenchParser(bench_file)
-        else:
-            parser = VerilogParser(bench_file)
-        
-        # Create miter
-        miter = WireFaultMiter(bench_file)
+        # Use cached instances (only parse circuit once per worker process!)
+        miter = get_cached_miter(bench_file)
         
         # Get ALL reachable outputs
         reachable = miter.get_reachable_outputs(fault_name)
         if not reachable:
             return None
         
-        # Create extractor once (shared across outputs for this fault)
-        extractor = VectorizedGraphExtractor(
-            bench_file, 
-            var_map=miter.var_map, 
-            device='cpu'
-        )
+        # Use cached extractor
+        extractor = get_cached_extractor(bench_file, miter.var_map)
         
         results = []
         
@@ -185,8 +219,11 @@ def process_single_fault_all_outputs(args):
                     clauses, assignment, cone_inputs, miter.var_map
                 )
                 
-                if len(critical_inputs) < 1:
-                    continue  # No critical inputs for this path, try next
+                # CHANGED: Accept even with 0 critical inputs (for analysis)
+                # Some faults may have no critical inputs if fault is easily detectable
+                # We still want these samples for training!
+                # if len(critical_inputs) < 1:
+                #     continue
                 
                 # =========================================================
                 # EXTRACT GRAPH FEATURES
@@ -218,15 +255,15 @@ def process_single_fault_all_outputs(args):
                 
                 results.append(result)
                 
-                # Clean up data object
+                # Clean up data object only (extractor is cached)
                 del data
                 
             except Exception as e:
                 # Skip this output, continue with next
                 continue
         
-        # Clean up extractor after all outputs processed
-        del extractor
+        # Don't delete extractor - it's cached for reuse!
+        # del extractor
         
         # Return list of results (one per successful output)
         # If no outputs succeeded, return None
@@ -444,6 +481,11 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
         print(f"  Min: {min(critical_counts)}")
         print(f"  Max: {max(critical_counts)}")
         print(f"  Avg: {sum(critical_counts) / len(critical_counts):.2f}")
+        
+        # Count samples with 0 critical inputs
+        zero_critical = sum(1 for c in critical_counts if c == 0)
+        if zero_critical > 0:
+            print(f"  Samples with 0 critical inputs: {zero_critical} ({zero_critical/len(dataset)*100:.1f}%)")
         
         # Count unique faults
         unique_faults = set((d.fault_name, d.fault_type) for d in dataset)
