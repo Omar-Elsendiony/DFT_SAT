@@ -163,6 +163,13 @@ def process_single_fault_all_outputs(args):
         if not reachable:
             return None
         
+        # CRITICAL FIX: Limit number of outputs to avoid pipe overflow
+        # Processing ALL outputs creates too much data (18+ samples per fault!)
+        # Limit to first 5 outputs to keep data size manageable
+        MAX_OUTPUTS_PER_FAULT = 5
+        if len(reachable) > MAX_OUTPUTS_PER_FAULT:
+            reachable = reachable[:MAX_OUTPUTS_PER_FAULT]
+        
         # Use cached extractor
         extractor = get_cached_extractor(bench_file, miter.var_map)
         
@@ -392,12 +399,14 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
     processed_count = 0
     last_save_count = len(dataset)
     
-    # Process faults
-    with Pool(num_workers) as pool:
+    # Process faults with LIMITED tasks per child to avoid memory buildup
+    # Each worker process will be restarted after processing some faults
+    # This prevents pipe buffer overflow and memory leaks
+    with Pool(num_workers, maxtasksperchild=50) as pool:
         async_result = pool.imap_unordered(
             process_single_fault_all_outputs, 
             fault_list, 
-            chunksize=1
+            chunksize=1  # Process one fault at a time
         )
         
         for i in range(len(fault_list)):
@@ -448,10 +457,16 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
                 processed_count += 1
                 print(f"  Warning: Fault {processed_count} timed out, skipping...")
                 continue
+            except BrokenPipeError:
+                # Pipe error - worker crashed, but we can continue with other faults
+                processed_count += 1
+                print(f"  Warning: Fault {processed_count} caused pipe error, skipping...")
+                continue
             except StopIteration:
                 break
             except Exception as e:
                 processed_count += 1
+                print(f"  Warning: Fault {processed_count} failed with error: {e}")
                 continue
     
     print(f"\nDataset generation complete!")
