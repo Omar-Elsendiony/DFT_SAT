@@ -1,22 +1,19 @@
 r"""
-VerilogParser - Enhanced for Yosys Output (FIXED: Consistent Wire Ordering)
+VerilogParser - Enhanced with DFF Pattern Detection
 
-CRITICAL FIX:
-- get_all_wires() now matches BenchParser behavior exactly
-- Only includes wires that are actually used in gates
-- Ensures consistent node ordering between .bench and .v formats
+CRITICAL ENHANCEMENT:
+- Detects DFF outputs by naming patterns when not explicitly instantiated
+- Handles synthesized netlists where DFF outputs are in port list
+- Patterns: *_reg_Q, *_state_reg*, DFF_*, *_Q, *_dff_*
 
-Handles:
-- Yosys header comments
-- Escaped identifiers (\a[0], \b[1], etc.)
-- Yosys internal gates (\$_AND_, \$_OR_, etc.)
-- Both named and positional port connections
+This fixes circuits like unit01/in_2.v where DFF_state_reg_Q is in the
+port list but has no explicit DFF instantiation.
 """
 
 import re
 
 class VerilogParser:
-    """Parser for gate-level Verilog with BenchParser-compatible API."""
+    """Parser for gate-level Verilog with DFF pattern detection."""
     
     GATE_MAPPINGS = {
         # Standard gates (lowercase)
@@ -24,7 +21,7 @@ class VerilogParser:
         'nor': 'NOR', 'xor': 'XOR', 'xnor': 'XNOR', 'buf': 'BUFF',
         'buffer': 'BUFF', 'dff': 'DFF', 'DFF': 'DFF',
         
-        # Yosys internal gates (with $_..._  format)
+        # Yosys internal gates
         '$_and_': 'AND', '$_or_': 'OR', '$_not_': 'NOT', '$_nand_': 'NAND',
         '$_nor_': 'NOR', '$_xor_': 'XOR', '$_xnor_': 'XNOR', '$_buf_': 'BUFF',
         '$_dff_': 'DFF', '$_dffe_': 'DFF',
@@ -32,6 +29,17 @@ class VerilogParser:
         '$_aoi3_': 'AOI3', '$_oai3_': 'OAI3',
         '$_aoi4_': 'AOI4', '$_oai4_': 'OAI4',
     }
+    
+    # DFF naming patterns (common in synthesized netlists)
+    DFF_OUTPUT_PATTERNS = [
+        r'.*_reg_Q$',           # state_reg_Q, data_reg_Q
+        r'.*_state_reg.*',      # DFF_state_reg, state_reg_0
+        r'^DFF_.*',             # DFF_state_reg_Q, DFF_0
+        r'.*_Q$',               # flip_flop_Q, reg_Q
+        r'.*_dff_.*',           # my_dff_out, dff_0
+        r'.*_ff_.*',            # my_ff_out, ff_0
+        r'.*\[Q\]$',            # reg[Q], state[Q]
+    ]
     
     def __init__(self, verilog_file):
         self.verilog_file = verilog_file
@@ -51,28 +59,27 @@ class VerilogParser:
         self.var_map = {}
         self.wires = []
         
+        # Track potential DFF outputs found in port list
+        self.potential_dff_outputs = set()
+        
         self._parse()
+    
+    def _is_dff_output_name(self, name):
+        """Check if wire name matches DFF output patterns."""
+        for pattern in self.DFF_OUTPUT_PATTERNS:
+            if re.match(pattern, name, re.IGNORECASE):
+                return True
+        return False
     
     def _remove_comments(self, content):
         """Remove ALL comments including Yosys headers."""
-        # Remove multi-line comments
         content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-        # Remove single-line comments
         content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
         return content
     
     def _normalize_identifier(self, name):
-        """
-        Normalize Verilog identifiers.
-        Removes escaped identifier backslash and trailing whitespace.
-        
-        Examples:
-            \\a[0]  -> a[0]
-            \\b[1]  -> b[1]
-            normal  -> normal
-        """
+        """Normalize Verilog identifiers."""
         name = name.strip()
-        # Remove leading backslash for escaped identifiers
         if name.startswith('\\'):
             name = name[1:].strip()
         return name
@@ -82,21 +89,21 @@ class VerilogParser:
         with open(self.verilog_file, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
         
-        # Remove comments FIRST
         content = self._remove_comments(content)
-        
-        # Extract modules
         modules = self._extract_modules(content)
         
         if not modules:
             raise ValueError("No module found in Verilog file")
         
-        # Process first module
         module_content = modules[0]
         
+        # Parse in order
         self._parse_ports(module_content)
         self._parse_wires(module_content)
         self._parse_instances(module_content)
+        
+        # NEW: Detect DFF outputs by naming pattern
+        self._detect_dff_outputs_by_pattern()
         
         # Build combined lists
         self.all_inputs = list(dict.fromkeys(self.inputs + self.ppis))
@@ -104,14 +111,12 @@ class VerilogParser:
     
     def _extract_modules(self, content):
         """Extract module definitions."""
-        # Handle both escaped and normal identifiers in module name and ports
         pattern = r'module\s+(\S+)\s*\((.*?)\);(.*?)endmodule'
         matches = re.findall(pattern, content, re.DOTALL)
-        return [match[2] for match in matches]  # Return module bodies
+        return [match[2] for match in matches]
     
     def _parse_ports(self, content):
-        """Parse input/output declarations."""
-        # Updated patterns to handle escaped identifiers
+        """Parse input/output declarations and detect potential DFF outputs."""
         input_pattern = r'input\s+(?:\[.*?\]\s+)?([^;]+);'
         output_pattern = r'output\s+(?:\[.*?\]\s+)?([^;]+);'
         
@@ -122,6 +127,10 @@ class VerilogParser:
                 name = re.sub(r'\[.*?\]', '', name).strip()
                 if name and name not in self.inputs:
                     self.inputs.append(name)
+                    
+                    # Check if this looks like a DFF output
+                    if self._is_dff_output_name(name):
+                        self.potential_dff_outputs.add(name)
         
         for match in re.finditer(output_pattern, content):
             ports = match.group(1).split(',')
@@ -142,17 +151,13 @@ class VerilogParser:
                 name = re.sub(r'\[.*?\]', '', name).strip()
                 if name and name not in self.wires:
                     self.wires.append(name)
+                    
+                    # Check if this looks like a DFF output
+                    if self._is_dff_output_name(name):
+                        self.potential_dff_outputs.add(name)
     
     def _parse_instances(self, content):
-        """Parse gate instances (handles both ICCAD positional and Yosys named formats)."""
-        # Pattern to match gate instances:
-        # - ICCAD: gate_type ( ports );
-        # - Yosys: \gate_type instance_name ( ports );
-        # Matches escaped identifiers starting with \ or regular identifiers
-        
-        # Identifier can be:
-        # - Escaped: \$_NAND_ or \a[0] (backslash followed by non-whitespace)
-        # - Regular: and, or, _inst123, etc. (word characters)
+        """Parse gate instances."""
         instance_pattern = r'(\\[^\s]+|\w+)\s+(?:(\\[^\s]+|\w+)\s+)?\(\s*(.*?)\s*\)\s*;'
         
         for match in re.finditer(instance_pattern, content, re.DOTALL):
@@ -160,7 +165,6 @@ class VerilogParser:
             inst_name = match.group(2) if match.group(2) else 'unnamed'
             port_list = match.group(3)
             
-            # Normalize gate type (remove backslash, convert to lowercase)
             gate_type_normalized = self._normalize_identifier(gate_type_raw).lower()
             
             if gate_type_normalized not in self.GATE_MAPPINGS:
@@ -181,6 +185,8 @@ class VerilogParser:
                     self.ppos.append(inputs[0])
                     self.dffs.append((output, inputs[0]))
                     self.dff_map[output] = inputs[0]
+                # Remove from potential DFFs (already found explicitly)
+                self.potential_dff_outputs.discard(output)
             else:
                 self.gates.append((output, gate_type, inputs))
                 self.gate_dict[output] = (gate_type, inputs)
@@ -190,14 +196,66 @@ class VerilogParser:
                         self.back_edges[inp] = []
                     self.back_edges[inp].append(output)
     
+    def _detect_dff_outputs_by_pattern(self):
+        """
+        NEW: Detect DFF outputs that weren't explicitly instantiated.
+        
+        This handles synthesized netlists where DFF outputs appear in:
+        - Module port list (as inputs)
+        - Wire declarations
+        But no explicit DFF gate instantiation exists.
+        """
+        for wire_name in self.potential_dff_outputs:
+            # Skip if already identified as DFF from instance
+            if wire_name in self.ppis:
+                continue
+            
+            # Check if this wire is actually used in the circuit
+            # (has fanout or is in gate connections)
+            is_used = (
+                wire_name in self.back_edges or
+                wire_name in self.gate_dict or
+                any(wire_name in inputs for _, _, inputs in self.gates)
+            )
+            
+            if is_used:
+                # Add as PPI
+                if wire_name in self.inputs:
+                    self.inputs.remove(wire_name)
+                
+                if wire_name not in self.ppis:
+                    self.ppis.append(wire_name)
+                
+                # Try to find corresponding D input (wire driving this DFF)
+                # Look for pattern: wire_name_D, wire_name without _Q, etc.
+                d_candidates = [
+                    wire_name.replace('_Q', '_D'),
+                    wire_name.replace('_Q', ''),
+                    wire_name + '_D',
+                    wire_name.replace('_reg_Q', '_reg_D'),
+                ]
+                
+                for d_wire in d_candidates:
+                    if d_wire in self.gate_dict or d_wire in self.wires:
+                        if d_wire not in self.ppos:
+                            self.ppos.append(d_wire)
+                        self.dffs.append((wire_name, d_wire))
+                        self.dff_map[wire_name] = d_wire
+                        break
+                else:
+                    # No D input found, just mark Q as PPI without PPO
+                    # (This is OK for ATPG - we can set Q to any value)
+                    pass
+                
+                print(f"  [INFO] Detected DFF output by pattern: {wire_name}")
+    
     def _parse_port_connections(self, port_list):
         """Parse port connections (positional or named)."""
         ports = []
         port_list = port_list.strip()
         
         if '.(' in port_list or ('.' in port_list and '(' in port_list):
-            # Named connections - handle escaped identifiers
-            # Pattern: .PORT_NAME(\wire_name) or .PORT_NAME(wire_name)
+            # Named connections
             named_pattern = r'\.(\w+)\s*\(\s*([^)]+)\s*\)'
             connections = {}
             
@@ -206,14 +264,12 @@ class VerilogParser:
                 wire_name = self._normalize_identifier(match.group(2))
                 connections[port_name] = wire_name
             
-            # Extract output first
             output_names = ['Y', 'Q', 'OUT', 'Z', 'O']
             for name in output_names:
                 if name in connections:
                     ports.append(connections[name])
                     break
             
-            # Extract inputs
             skip_ports = ['CLK', 'CLOCK', 'RST', 'RESET', 'SET', 'CLEAR', 'EN', 'ENABLE']
             for port_name, wire_name in connections.items():
                 if port_name not in output_names and port_name not in skip_ports:
@@ -231,26 +287,12 @@ class VerilogParser:
     # =========================================================================
     
     def get_all_wires(self):
-        """
-        CRITICAL FIX: Match BenchParser behavior exactly!
-        
-        Only include wires that are ACTUALLY USED in the circuit:
-        - Primary inputs/outputs (all_inputs, all_outputs)
-        - Wires referenced in gates (outputs and inputs)
-        
-        DO NOT include declared-but-unused wires from self.wires!
-        This ensures consistent ordering with BenchParser.
-        """
-        # Start with inputs and outputs (same as BenchParser)
+        """Get all wires actually used in the circuit."""
         wires = set(self.all_inputs + self.all_outputs)
         
-        # Add wires used in gates (same as BenchParser)
         for out, _, inputs in self.gates:
             wires.add(out)
             wires.update(inputs)
-        
-        # DO NOT add self.wires here - this was the bug!
-        # self.wires may contain declared-but-unused wires
         
         return sorted(list(wires))
     
