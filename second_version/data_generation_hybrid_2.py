@@ -140,17 +140,18 @@ def identify_critical_inputs_adaptive(clauses, assignment, cone_inputs, var_map,
     return critical_inputs
 
 
-def process_single_fault_all_outputs(args):
+def process_single_fault_first_output(args):
     """
-    Process single fault for ALL reachable outputs.
+    Process single fault for FIRST reachable output only.
     
+    This is more stable than ALL outputs mode (avoids pipe overflow).
     Uses per-process caching to avoid re-parsing the circuit for every fault!
     
     Args:
         args: (bench_file, fault_name, fault_type)
     
     Returns:
-        List of result dicts, or None if fault is untestable
+        Single result dict, or None if fault is untestable
     """
     bench_file, fault_name, fault_type = args
     
@@ -163,21 +164,17 @@ def process_single_fault_all_outputs(args):
         if not reachable:
             return None
         
-        # CRITICAL FIX: Limit number of outputs to avoid pipe overflow
-        # Processing ALL outputs creates too much data (18+ samples per fault!)
-        # Limit to first 5 outputs to keep data size manageable
-        MAX_OUTPUTS_PER_FAULT = 5
-        if len(reachable) > MAX_OUTPUTS_PER_FAULT:
-            reachable = reachable[:MAX_OUTPUTS_PER_FAULT]
+        # SIMPLIFIED: Use ONLY the first reachable output (stable, no pipe overflow)
+        # This is more reliable than processing multiple outputs
+        target_output = reachable[0]
         
         # Use cached extractor
         extractor = get_cached_extractor(bench_file, miter.var_map)
         
         results = []
         
-        # Process EACH reachable output separately
-        for target_output in reachable:
-            try:
+        # Process ONLY the first output (simple and stable)
+        try:
                 # =========================================================
                 # BUILD MITER FOR THIS SPECIFIC OUTPUT
                 # =========================================================
@@ -260,21 +257,18 @@ def process_single_fault_all_outputs(args):
                     'num_cone_inputs': int(len(cone_inputs))
                 }
                 
-                results.append(result)
-                
                 # Clean up data object only (extractor is cached)
                 del data
                 
+                # Return single result (not a list)
+                return result
+                
             except Exception as e:
-                # Skip this output, continue with next
-                continue
+                # Failed to process this fault
+                return None
         
-        # Don't delete extractor - it's cached for reuse!
-        # del extractor
-        
-        # Return list of results (one per successful output)
-        # If no outputs succeeded, return None
-        return results if results else None
+        # Should not reach here
+        return None
         
     except Exception as e:
         # Fault completely failed
@@ -363,7 +357,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
             fault_list.append((bench_file, gate, 1))
     
     print(f"Processing {len(fault_list)} faults using {num_workers} workers")
-    print(f"Mode: ALL OUTPUTS (extracts maximum training data)")
+    print(f"Mode: FIRST OUTPUT (stable, one sample per fault)")
     
     # Setup save paths with relative path encoding
     os.makedirs(output_dir, exist_ok=True)
@@ -404,7 +398,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
     # This prevents pipe buffer overflow and memory leaks
     with Pool(num_workers, maxtasksperchild=50) as pool:
         async_result = pool.imap_unordered(
-            process_single_fault_all_outputs, 
+            process_single_fault_first_output,  # Changed to first output only
             fault_list, 
             chunksize=1  # Process one fault at a time
         )
@@ -415,15 +409,9 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
                 processed_count += 1
                 
                 if result is not None:
-                    # Result is a LIST of dicts (one per output)
-                    if isinstance(result, list):
-                        for result_dict in result:
-                            data = dict_to_data(result_dict)
-                            dataset.append(data)
-                    else:
-                        # Single result (shouldn't happen with all_outputs, but handle it)
-                        data = dict_to_data(result)
-                        dataset.append(data)
+                    # Result is now a single dict (not a list)
+                    data = dict_to_data(result)
+                    dataset.append(data)
                 
                 # Incremental save
                 if len(dataset) - last_save_count >= save_interval:
@@ -512,7 +500,7 @@ def generate_dataset_parallel(bench_file, output_dir, num_workers=4,
 
 
 def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4, 
-                                max_faults_per_circuit=None, seed=42):
+                                max_faults_per_circuit=None, seed=42, skip_in_2=False):
     """Generate dataset for all circuits in folder (recursive with rglob)"""
     from pathlib import Path
     
@@ -525,10 +513,15 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4,
         print(f"No .bench or .v files found in {bench_folder}")
         return 0
     
+    # Optional: Skip in_2.v files (they seem problematic - produce 0 samples)
+    if skip_in_2:
+        bench_files = [f for f in bench_files if 'in_2.v' not in str(f)]
+        print(f"Skipping in_2.v files (problematic circuits)")
+    
     print(f"Found {len(bench_files)} circuits in {bench_folder} (recursive search)")
     if max_faults_per_circuit:
         print(f"Will sample {max_faults_per_circuit} faults per circuit (seed={seed})")
-    print(f"Mode: ALL OUTPUTS (maximum data extraction)")
+    print(f"Mode: FIRST OUTPUT (stable, reliable)")
     bench_files = sorted(bench_files)
     
     total_samples = 0
@@ -624,6 +617,8 @@ Expected: 2-3x more training samples compared to single-output mode!
                        help='Maximum faults to sample per circuit (None = all)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for fault sampling')
+    parser.add_argument('--skip_in_2', action='store_true',
+                       help='Skip in_2.v files (they produce 0 samples)')
     
     args = parser.parse_args()
     
@@ -633,16 +628,17 @@ Expected: 2-3x more training samples compared to single-output mode!
     bench_path = Path(args.bench)
     
     print("="*70)
-    print("DATA GENERATION - ALL OUTPUTS MODE")
+    print("DATA GENERATION - FIRST OUTPUT MODE (STABLE)")
     print("="*70)
-    print("This mode processes ALL reachable outputs per fault")
-    print("Expected: 2-3x more training samples")
+    print("This mode processes FIRST reachable output per fault")
+    print("More stable than ALL outputs, no pipe overflow")
     print("="*70)
     
     if bench_path.is_dir():
         generate_dataset_for_folder(
             args.bench, args.output, args.workers, 
-            max_faults_per_circuit=args.max_faults, seed=args.seed
+            max_faults_per_circuit=args.max_faults, seed=args.seed,
+            skip_in_2=args.skip_in_2
         )
     elif bench_path.is_file():
         # For single file, use parent directory as root
