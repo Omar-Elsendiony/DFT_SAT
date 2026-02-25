@@ -171,104 +171,91 @@ def process_single_fault_first_output(args):
         # Use cached extractor
         extractor = get_cached_extractor(bench_file, miter.var_map)
         
-        results = []
-        
         # Process ONLY the first output (simple and stable)
-        try:
-                # =========================================================
-                # BUILD MITER FOR THIS SPECIFIC OUTPUT
-                # =========================================================
-                clauses = miter.build_miter(
-                    fault_name, 
-                    fault_type, 
-                    force_diff=1,
-                    target_output=target_output  # ✅ Specific output!
-                )
-                
-                if not clauses:
-                    continue  # Skip this output, try next
-                
-                # =========================================================
-                # GET CONE FOR SAME OUTPUT (consistency!)
-                # =========================================================
-                complete_cone = miter.get_complete_atpg_cone(
-                    fault_name, 
-                    target_output
-                )
-                
-                if not complete_cone:
-                    continue
-                
-                # =========================================================
-                # SOLVE TO GET ASSIGNMENT
-                # =========================================================
-                with Glucose3(bootstrap_with=clauses) as solver:
-                    solver.conf_budget(CONFLICT_BUDGET)
-                    if not solver.solve():
-                        continue  # This output not testable, try next
-                    
-                    assignment = set(solver.get_model())
-                
-                # =========================================================
-                # GET CONE INPUTS
-                # =========================================================
-                cone_inputs = miter.get_cone_inputs(complete_cone)
-                if not cone_inputs:
-                    continue
-                
-                # =========================================================
-                # IDENTIFY CRITICAL INPUTS
-                # =========================================================
-                critical_inputs = identify_critical_inputs_adaptive(
-                    clauses, assignment, cone_inputs, miter.var_map
-                )
-                
-                # CHANGED: Accept even with 0 critical inputs (for analysis)
-                # Some faults may have no critical inputs if fault is easily detectable
-                # We still want these samples for training!
-                # if len(critical_inputs) < 1:
-                #     continue
-                
-                # =========================================================
-                # EXTRACT GRAPH FEATURES
-                # =========================================================
-                data = extractor.get_data_for_fault(fault_name, fault_type=fault_type)
-                
-                # =========================================================
-                # CREATE RESULT (Plain Python dict for pickling)
-                # =========================================================
-                # Convert ALL data to plain Python types (no PyTorch references)
-                node_names_list = [str(name) for name in data.node_names]  # Ensure strings
-                x_numpy = data.x.detach().cpu().numpy().copy()  # Detach + copy!
-                edge_index_numpy = data.edge_index.detach().cpu().numpy().copy()  # Detach + copy!
-                
-                # Convert critical_inputs dict to plain types
-                critical_inputs_plain = {str(k): float(v) for k, v in critical_inputs.items()}
-                
-                result = {
-                    'node_names': node_names_list,
-                    'x': x_numpy,
-                    'edge_index': edge_index_numpy,
-                    'critical_inputs': critical_inputs_plain,
-                    'fault_name': str(fault_name),
-                    'fault_type': int(fault_type),
-                    'target_output': str(target_output),
-                    'num_critical_inputs': int(len(critical_inputs)),
-                    'num_cone_inputs': int(len(cone_inputs))
-                }
-                
-                # Clean up data object only (extractor is cached)
-                del data
-                
-                # Return single result (not a list)
-                return result
-                
-            except Exception as e:
-                # Failed to process this fault
-                return None
+        # =========================================================
+        # BUILD MITER FOR THIS SPECIFIC OUTPUT
+        # =========================================================
+        clauses = miter.build_miter(
+            fault_name, 
+            fault_type, 
+            force_diff=1,
+            target_output=target_output  # ✅ Specific output!
+        )
         
-        # Should not reach here
-        return None
+        if not clauses:
+            return None  # Can't build miter
+        
+        # =========================================================
+        # GET CONE FOR SAME OUTPUT (consistency!)
+        # =========================================================
+        complete_cone = miter.get_complete_atpg_cone(
+            fault_name, 
+            target_output
+        )
+        
+        if not complete_cone:
+            return None  # Can't get cone
+        
+        # =========================================================
+        # SOLVE TO GET ASSIGNMENT
+        # =========================================================
+        with Glucose3(bootstrap_with=clauses) as solver:
+            solver.conf_budget(CONFLICT_BUDGET)
+            if not solver.solve():
+                return None  # Fault not testable
+            
+            assignment = set(solver.get_model())
+        
+        # =========================================================
+        # GET CONE INPUTS
+        # =========================================================
+        cone_inputs = miter.get_cone_inputs(complete_cone)
+        if not cone_inputs:
+            return None  # No cone inputs
+        
+        # =========================================================
+        # IDENTIFY CRITICAL INPUTS
+        # =========================================================
+        critical_inputs = identify_critical_inputs_adaptive(
+            clauses, assignment, cone_inputs, miter.var_map
+        )
+        
+        # Accept even with 0 critical inputs (for analysis)
+        # Some faults may have no critical inputs if fault is easily detectable
+        
+        # =========================================================
+        # EXTRACT GRAPH FEATURES
+        # =========================================================
+        data = extractor.get_data_for_fault(fault_name, fault_type=fault_type)
+        
+        # =========================================================
+        # CREATE RESULT (Plain Python dict for pickling)
+        # =========================================================
+        # Convert ALL data to plain Python types (no PyTorch references)
+        node_names_list = [str(name) for name in data.node_names]  # Ensure strings
+        x_numpy = data.x.detach().cpu().numpy().copy()  # Detach + copy!
+        edge_index_numpy = data.edge_index.detach().cpu().numpy().copy()  # Detach + copy!
+        
+        # Convert critical_inputs dict to plain types
+        critical_inputs_plain = {str(k): float(v) for k, v in critical_inputs.items()}
+        
+        result = {
+            'node_names': node_names_list,
+            'x': x_numpy,
+            'edge_index': edge_index_numpy,
+            'critical_inputs': critical_inputs_plain,
+            'fault_name': str(fault_name),
+            'fault_type': int(fault_type),
+            'target_output': str(target_output),
+            'num_critical_inputs': int(len(critical_inputs)),
+            'num_cone_inputs': int(len(cone_inputs))
+        }
+        
+        # Clean up data object only (extractor is cached)
+        del data
+        
+        # Return single result
+        return result
         
     except Exception as e:
         # Fault completely failed
