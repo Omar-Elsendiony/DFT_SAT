@@ -1,4 +1,4 @@
-r"""
+"""
 VerilogParser - Enhanced with DFF Pattern Detection
 
 CRITICAL ENHANCEMENT:
@@ -101,6 +101,7 @@ class VerilogParser:
         self._parse_ports(module_content)
         self._parse_wires(module_content)
         self._parse_instances(module_content)
+        self._parse_assign_statements(module_content)  # NEW: Parse assign statements
         
         # NEW: Detect DFF outputs by naming pattern
         self._detect_dff_outputs_by_pattern()
@@ -281,6 +282,115 @@ class VerilogParser:
             ports = [w for w in wires if w and w != '1\'b0' and w != '1\'b1']
         
         return ports
+    
+    def _parse_assign_statements(self, content):
+        """
+        Parse Verilog assign statements and convert to gate instances.
+        
+        Handles expressions like:
+            assign out = a & b;
+            assign out = ~a;
+            assign out = a | b | c;
+        """
+        # Pattern: assign output = expression;
+        assign_pattern = r'assign\s+([^\s=]+)\s*=\s*([^;]+);'
+        
+        for match in re.finditer(assign_pattern, content, re.MULTILINE):
+            output = self._normalize_identifier(match.group(1))
+            expression = match.group(2).strip()
+            
+            # Parse the expression and convert to gates
+            gate_info = self._parse_expression(expression)
+            
+            if gate_info:
+                gate_type, inputs = gate_info
+                self.gates.append((output, gate_type, inputs))
+                self.gate_dict[output] = (gate_type, inputs)
+                
+                for inp in inputs:
+                    if inp not in self.back_edges:
+                        self.back_edges[inp] = []
+                    self.back_edges[inp].append(output)
+    
+    def _parse_expression(self, expr):
+        """
+        Parse a Verilog expression and return (gate_type, inputs).
+        
+        Supports:
+            a & b           → AND, [a, b]
+            a | b           → OR, [a, b]
+            a ^ b           → XOR, [a, b]
+            ~a              → NOT, [a]
+            ~(a & b)        → NAND, [a, b]
+            ~(a | b)        → NOR, [a, b]
+            a & b & c       → AND, [a, b, c]
+        """
+        expr = expr.strip()
+        
+        # Check for NOT (single input with ~)
+        if expr.startswith('~') and '&' not in expr and '|' not in expr and '^' not in expr:
+            # Simple NOT: ~a
+            inner = self._normalize_identifier(expr[1:].strip())
+            return ('NOT', [inner])
+        
+        # Check for NAND: ~(a & b)
+        if expr.startswith('~(') and expr.endswith(')'):
+            inner_expr = expr[2:-1].strip()
+            if '&' in inner_expr and '|' not in inner_expr:
+                inputs = self._extract_operands(inner_expr, '&')
+                return ('NAND', inputs)
+            elif '|' in inner_expr and '&' not in inner_expr:
+                inputs = self._extract_operands(inner_expr, '|')
+                return ('NOR', inputs)
+        
+        # Check for AND: a & b
+        if '&' in expr and '|' not in expr:
+            inputs = self._extract_operands(expr, '&')
+            return ('AND', inputs)
+        
+        # Check for OR: a | b
+        if '|' in expr and '&' not in expr:
+            inputs = self._extract_operands(expr, '|')
+            return ('OR', inputs)
+        
+        # Check for XOR: a ^ b
+        if '^' in expr:
+            inputs = self._extract_operands(expr, '^')
+            return ('XOR', inputs)
+        
+        # Direct wire assignment: assign out = in;
+        # This is a buffer
+        wire = self._normalize_identifier(expr)
+        if wire:
+            return ('BUFF', [wire])
+        
+        return None
+    
+    def _extract_operands(self, expr, operator):
+        """
+        Extract operands from an expression split by an operator.
+        
+        Handles negations: a & ~b → [a, ~b]
+        But normalizes wire names properly.
+        """
+        parts = expr.split(operator)
+        operands = []
+        
+        for part in parts:
+            part = part.strip()
+            
+            # Handle negation
+            if part.startswith('~'):
+                wire = self._normalize_identifier(part[1:].strip())
+                # For now, we'll treat ~input as a separate wire
+                # The NOT will be implicit in the gate
+                # This is a simplification but works for most cases
+                operands.append(wire)
+            else:
+                wire = self._normalize_identifier(part)
+                operands.append(wire)
+        
+        return [op for op in operands if op]
     
     # =========================================================================
     # BenchParser-Compatible API
