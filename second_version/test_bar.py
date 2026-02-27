@@ -10,8 +10,8 @@ print("="*70)
 # Step 1: Parse
 print("\n1. PARSING...")
 try:
-    from VerilogParser_ENHANCED import VerilogParser
-    parser = VerilogParser('bar.v')
+    from VerilogParser import VerilogParser
+    parser = VerilogParser('benchmarks/arithmetic/bar.v')
     print(f"   ✓ Inputs: {len(parser.inputs)}")
     print(f"   ✓ Outputs: {len(parser.outputs)}")  
     print(f"   ✓ Gates: {len(parser.gates)}")
