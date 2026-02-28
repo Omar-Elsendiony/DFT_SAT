@@ -1,4 +1,4 @@
-"""
+r"""
 VerilogParser - Enhanced with DFF Pattern Detection
 
 CRITICAL ENHANCEMENT:
@@ -121,7 +121,8 @@ class VerilogParser:
         input_pattern = r'input\s+(?:\[.*?\]\s+)?([^;]+);'
         output_pattern = r'output\s+(?:\[.*?\]\s+)?([^;]+);'
         
-        for match in re.finditer(input_pattern, content):
+        # Use re.DOTALL to handle multi-line declarations
+        for match in re.finditer(input_pattern, content, re.DOTALL):
             ports = match.group(1).split(',')
             for port in ports:
                 name = self._normalize_identifier(port)
@@ -133,7 +134,8 @@ class VerilogParser:
                     if self._is_dff_output_name(name):
                         self.potential_dff_outputs.add(name)
         
-        for match in re.finditer(output_pattern, content):
+        # Use re.DOTALL to handle multi-line declarations
+        for match in re.finditer(output_pattern, content, re.DOTALL):
             ports = match.group(1).split(',')
             for port in ports:
                 name = self._normalize_identifier(port)
