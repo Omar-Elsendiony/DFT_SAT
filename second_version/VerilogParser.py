@@ -14,7 +14,7 @@ import re
 
 class VerilogParser:
     """Parser for gate-level Verilog with DFF pattern detection."""
-    print("Creating class")
+    
     GATE_MAPPINGS = {
         # Standard gates (lowercase)
         'and': 'AND', 'or': 'OR', 'not': 'NOT', 'nand': 'NAND',
@@ -126,7 +126,8 @@ class VerilogParser:
             ports = match.group(1).split(',')
             for port in ports:
                 name = self._normalize_identifier(port)
-                name = re.sub(r'\[.*?\]', '', name).strip()
+                # Don't strip array indices - keep them!
+                # name = re.sub(r'\[.*?\]', '', name).strip()  # OLD - strips [0], [1]
                 if name and name not in self.inputs:
                     self.inputs.append(name)
                     
@@ -139,7 +140,8 @@ class VerilogParser:
             ports = match.group(1).split(',')
             for port in ports:
                 name = self._normalize_identifier(port)
-                name = re.sub(r'\[.*?\]', '', name).strip()
+                # Don't strip array indices - keep them!
+                # name = re.sub(r'\[.*?\]', '', name).strip()  # OLD - strips [0], [1]
                 if name and name not in self.outputs:
                     self.outputs.append(name)
     
