@@ -14,7 +14,7 @@ import re
 
 class VerilogParser:
     """Parser for gate-level Verilog with DFF pattern detection."""
-    
+    print("Creating class")
     GATE_MAPPINGS = {
         # Standard gates (lowercase)
         'and': 'AND', 'or': 'OR', 'not': 'NOT', 'nand': 'NAND',
