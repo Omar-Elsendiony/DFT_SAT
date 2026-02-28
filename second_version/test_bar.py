@@ -30,7 +30,7 @@ except Exception as e:
 print("\n2. CREATING MITER...")
 try:
     from WireFaultMiter import WireFaultMiter
-    miter = WireFaultMiter('bar.v')
+    miter = WireFaultMiter('benchmarks/arithmetic/bar.v')
     print(f"   ✓ Miter created")
 except Exception as e:
     print(f"   ✗ Miter failed: {e}")
