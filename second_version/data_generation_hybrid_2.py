@@ -522,7 +522,7 @@ def generate_dataset_for_folder(bench_folder, output_dir, num_workers=4,
         print(f"Skipping in_2.v files (problematic circuits)")
         
     # Skip specific problematic files
-    skip_files = {"bar.v", "adder.v", "div.v"}
+    skip_files = {"bar.v", "adder.v", "div.v", "hyp.v"}
 
     bench_files = [
         f for f in bench_files
